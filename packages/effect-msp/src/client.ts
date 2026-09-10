@@ -1,0 +1,172 @@
+/**
+ * effect-msp/client — typed MSP client over one `muse serve` host process.
+ *
+ * One `MspClient` owns exactly one spawned host process (one MSP
+ * connection). Callers that want one host per T3 thread create one
+ * `MspClient` per thread, matching the OpenCode/Claude/Codex driver
+ * precedent of scoping provider process lifetime to the resource that
+ * consumes it.
+ *
+ * @module effect-msp/client
+ */
+import * as Effect from "effect/Effect";
+import * as Schema from "effect/Schema";
+import * as Scope from "effect/Scope";
+import * as Stdio from "effect/Stdio";
+import * as Stream from "effect/Stream";
+import { ChildProcess, ChildProcessSpawner } from "effect/unstable/process";
+
+import * as MspError from "./errors.ts";
+import * as MspProtocol from "./protocol.ts";
+import * as MspSchema from "./schema.ts";
+import { makeChildStdio, makeTerminationError } from "./_internal/stdio.ts";
+
+export interface MspClientOptions {
+  readonly command: string;
+  readonly args: ReadonlyArray<string>;
+  readonly env?: Record<string, string | undefined>;
+  readonly cwd?: string;
+  readonly logIncoming?: boolean;
+  readonly logOutgoing?: boolean;
+  readonly logger?: (event: MspProtocol.MspProtocolLogEvent) => Effect.Effect<void, never>;
+}
+
+const decodeResult = <A, I>(
+  method: string,
+  schema: Schema.Codec<A, I>,
+  raw: unknown,
+): Effect.Effect<A, MspError.MspError> =>
+  Schema.decodeUnknownEffect(schema)(raw).pipe(
+    Effect.mapError((cause) =>
+      MspError.MspProtocolParseError.fromSchemaError("decode-response-payload", cause, { method }),
+    ),
+  );
+
+/**
+ * MSP notification, narrowed by method. The `params` schema for each
+ * literal is provided by the caller of `notifications.pipe(Stream.filter(...))`
+ * — see `MuseAdapter.ts` for the dispatch table. Kept generic here so this
+ * package does not need to schematize every one of MSP's ~30 notification
+ * shapes to be useful.
+ */
+export interface MspNotification {
+  readonly method: string;
+  readonly params: unknown;
+}
+
+export interface MspClient {
+  readonly notifications: Stream.Stream<MspNotification>;
+  readonly initialize: (
+    params: MspSchema.InitializeParams,
+  ) => Effect.Effect<MspSchema.InitializeResult, MspError.MspError>;
+  readonly sessionStart: (
+    params: MspSchema.SessionStartParams,
+  ) => Effect.Effect<MspSchema.SessionStartResult, MspError.MspError>;
+  readonly sessionResume: (
+    params: MspSchema.SessionResumeParams,
+  ) => Effect.Effect<MspSchema.SessionResumeResult, MspError.MspError>;
+  readonly sessionSetModel: (
+    params: MspSchema.SessionSetModelParams,
+  ) => Effect.Effect<MspSchema.SessionSetModelResult, MspError.MspError>;
+  readonly sessionSetApprovalMode: (
+    params: MspSchema.SessionSetApprovalModeParams,
+  ) => Effect.Effect<MspSchema.SessionSetApprovalModeResult, MspError.MspError>;
+  readonly sessionCompact: (
+    params: MspSchema.SessionCompactParams,
+  ) => Effect.Effect<MspSchema.SessionCompactResult, MspError.MspError>;
+  readonly turnStart: (
+    params: MspSchema.TurnStartParams,
+  ) => Effect.Effect<MspSchema.TurnStartResult, MspError.MspError>;
+  readonly turnInterrupt: (
+    params: MspSchema.TurnInterruptParams,
+  ) => Effect.Effect<MspSchema.TurnInterruptResult, MspError.MspError>;
+  readonly turnSteer: (
+    params: MspSchema.TurnSteerParams,
+  ) => Effect.Effect<MspSchema.TurnSteerResult, MspError.MspError>;
+  readonly approvalDecide: (
+    params: MspSchema.ApprovalDecideParams,
+  ) => Effect.Effect<MspSchema.ApprovalDecideResult, MspError.MspError>;
+  readonly approvalListPending: (
+    params: MspSchema.ApprovalListPendingParams,
+  ) => Effect.Effect<MspSchema.ApprovalListPendingResult, MspError.MspError>;
+  readonly userInputAnswer: (
+    params: MspSchema.UserInputAnswerParams,
+  ) => Effect.Effect<MspSchema.UserInputAnswerResult, MspError.MspError>;
+  readonly userInputCancel: (
+    params: MspSchema.UserInputCancelParams,
+  ) => Effect.Effect<MspSchema.UserInputCancelResult, MspError.MspError>;
+  readonly modelList: (
+    params: MspSchema.ModelListParams,
+  ) => Effect.Effect<MspSchema.ModelListResult, MspError.MspError>;
+}
+
+/**
+ * Build a client directly over an already-open `Stdio.Stdio` duplex. Used by
+ * tests (in-memory stdio against a scripted fake host) and by `spawn` below
+ * (child-process stdio).
+ */
+export const makeOverStdio = Effect.fn("effect-msp/makeOverStdio")(function* (
+  stdio: Stdio.Stdio,
+  options: { readonly terminationError?: Effect.Effect<MspError.MspError> } = {},
+): Effect.fn.Return<MspClient, never, Scope.Scope> {
+  const protocol = yield* MspProtocol.makeMspPatchedProtocol({
+    stdio,
+    ...(options.terminationError ? { terminationError: options.terminationError } : {}),
+  });
+
+  const call = <A, I>(method: string, schema: Schema.Codec<A, I>, payload: unknown) =>
+    protocol
+      .request(method, payload)
+      .pipe(Effect.flatMap((raw) => decodeResult(method, schema, raw)));
+
+  return {
+    notifications: Stream.map(protocol.incomingNotifications, (notification) => ({
+      method: notification.method,
+      params: notification.params,
+    })),
+    initialize: (params) => call("initialize", MspSchema.InitializeResult, params),
+    sessionStart: (params) => call("session/start", MspSchema.SessionStartResult, params),
+    sessionResume: (params) => call("session/resume", MspSchema.SessionResumeResult, params),
+    sessionSetModel: (params) => call("session/setModel", MspSchema.SessionSetModelResult, params),
+    sessionSetApprovalMode: (params) =>
+      call("session/setApprovalMode", MspSchema.SessionSetApprovalModeResult, params),
+    sessionCompact: (params) => call("session/compact", MspSchema.SessionCompactResult, params),
+    turnStart: (params) => call("turn/start", MspSchema.TurnStartResult, params),
+    turnInterrupt: (params) => call("turn/interrupt", MspSchema.TurnInterruptResult, params),
+    turnSteer: (params) => call("turn/steer", MspSchema.TurnSteerResult, params),
+    approvalDecide: (params) => call("approval/decide", MspSchema.ApprovalDecideResult, params),
+    approvalListPending: (params) =>
+      call("approval/listPending", MspSchema.ApprovalListPendingResult, params),
+    userInputAnswer: (params) => call("userInput/answer", MspSchema.UserInputAnswerResult, params),
+    userInputCancel: (params) => call("userInput/cancel", MspSchema.UserInputCancelResult, params),
+    modelList: (params) => call("model/list", MspSchema.ModelListResult, params),
+  } satisfies MspClient;
+});
+
+/**
+ * Spawn `muse serve` (or an equivalent command/args pair) and build a client
+ * over its stdio. The child is scoped: it is killed when the returned
+ * scope closes, never by matching its name or pid against a process list.
+ */
+export const spawn = Effect.fn("effect-msp/spawn")(function* (
+  options: MspClientOptions,
+): Effect.fn.Return<
+  MspClient,
+  MspError.MspError,
+  Scope.Scope | ChildProcessSpawner.ChildProcessSpawner
+> {
+  const spawner = yield* ChildProcessSpawner.ChildProcessSpawner;
+  const handle = yield* spawner
+    .spawn(
+      ChildProcess.make(options.command, options.args, {
+        cwd: options.cwd,
+        env: options.env,
+      }),
+    )
+    .pipe(
+      Effect.mapError((cause) => new MspError.MspSpawnError({ command: options.command, cause })),
+    );
+
+  const stdio = makeChildStdio(handle);
+  return yield* makeOverStdio(stdio, { terminationError: makeTerminationError(handle) });
+});

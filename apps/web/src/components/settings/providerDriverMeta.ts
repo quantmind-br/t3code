@@ -4,6 +4,7 @@ import {
   CodexSettings,
   CursorSettings,
   GrokSettings,
+  MuseSettings,
   OpenCodeSettings,
   ProviderDriverKind,
 } from "@t3tools/contracts";
@@ -15,6 +16,7 @@ import {
   GrokIcon,
   type Icon,
   OpenAI,
+  MuseIcon,
   OpenCodeIcon,
 } from "../Icons";
 
@@ -81,6 +83,13 @@ const PROVIDER_CLIENT_DEFINITIONS: readonly ProviderClientDefinition[] = [
     label: "Antigravity",
     icon: AntigravityIcon,
     settingsSchema: AntigravitySettings,
+  },
+  {
+    value: ProviderDriverKind.make("muse"),
+    label: "Muse Code",
+    icon: MuseIcon,
+    badgeLabel: "Early Access",
+    settingsSchema: MuseSettings,
   },
 ];
 

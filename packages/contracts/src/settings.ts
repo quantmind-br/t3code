@@ -707,6 +707,35 @@ export const GrokSettings = makeProviderSettingsSchema(
 export type GrokSettings = typeof GrokSettings.Type;
 
 /**
+ * Muse Code driver settings — a post-migration driver (see `ProviderDriverKind`
+ * in `providerInstance.ts`): configured only through `providerInstances`,
+ * never through the legacy `providers.<kind>` map. Off by default, same as
+ * Cursor/Grok/OpenCode: a new binding earns its way onto every install.
+ */
+export const MuseSettings = makeProviderSettingsSchema(
+  {
+    enabled: Schema.Boolean.pipe(
+      Schema.withDecodingDefault(Effect.succeed(false)),
+      Schema.annotateKey({ providerSettingsForm: { hidden: true } }),
+    ),
+    binaryPath: makeBinaryPathSetting("muse").pipe(
+      Schema.annotateKey({
+        title: "Binary path",
+        description: "Path to the Muse Code launcher binary.",
+        providerSettingsForm: { placeholder: "muse", clearWhenEmpty: "omit" },
+      }),
+    ),
+    customModels: Schema.Array(CustomModelSetting).pipe(
+      Schema.withDecodingDefault(Effect.succeed([])),
+      Schema.annotateKey({ providerSettingsForm: { hidden: true } }),
+    ),
+  },
+  {
+    order: ["binaryPath"],
+  },
+);
+export type MuseSettings = typeof MuseSettings.Type;
+/**
  * Antigravity ACP auth methods. Personal and Enterprise open a Google sign-in
  * in the browser. The API key and Agent Platform methods take credentials from
  * the instance config and never open a browser.

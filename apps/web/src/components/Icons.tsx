@@ -219,6 +219,21 @@ export const GrokIcon: Icon = ({ className, ...props }) => (
   </svg>
 );
 
+/**
+ * Generic monogram placeholder — Muse Code has no distributed brand mark to
+ * embed here yet. Swap for the real mark if/when one becomes available.
+ */
+export const MuseIcon: Icon = ({ className, ...props }) => (
+  <svg
+    {...props}
+    viewBox="0 0 24 24"
+    fill="none"
+    className={cn("fill-[#0F0F0F] dark:fill-[#F5F5F5]", className)}
+  >
+    <path d="M4 19V5h3.2l4.8 8 4.8-8H20v14h-2.6V9.3l-4 6.6h-.8l-4-6.6V19H4Z" />
+  </svg>
+);
+
 export const TraeIcon: Icon = (props) => (
   <svg {...props} viewBox="0 0 24 24" fill="currentColor">
     {/* Back rectangle: left strip + bottom strip drawn separately — empty bottom-left corner is the gap between them */}
