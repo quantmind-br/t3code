@@ -21,16 +21,12 @@
  * rendering, `view/gap` recovery (a dropped-notification bracket surfaces
  * as a `runtime.warning` today rather than a splice-fill), and
  * `readThread`, which serves this adapter's own in-memory item cache
- * (populated from live notifications) rather than a fresh `session/read`
- * query — sufficient for feedback upload and diagnostics, not a substitute
- * for the native session log. Also known and accepted: if the notification
- * queue fails on a protocol-level parse/write error (as opposed to the host
- * process actually exiting), this thread's state is dropped from the map so
- * new calls fail cleanly, but the underlying scope is not force-closed from
- * inside the consumer's own fiber — `Scope.close` on a scope from one of its
- * own children risks a self-deadlock this codebase hasn't verified is safe.
- * The common case (host process exited) doesn't hit this: the OS process is
- * already gone.
+ * (seeded from resume history, then live notifications) grouped by turn
+ * rather than a fresh `session/read` query — sufficient for feedback upload
+ * and diagnostics, not a substitute for the native session log.
+ * Conversation rollback IS supported, via `session/fork` — see
+ * `rollbackThread` for the exact semantics and its one limit (cannot rewind
+ * past the first turn).
  *
  * @module provider/Layers/MuseAdapter
  */
@@ -132,7 +128,10 @@ interface MuseThreadState {
   readonly threadId: ThreadId;
   readonly scope: Scope.Closeable;
   readonly client: MspClient.MspClient;
-  readonly museSessionId: string;
+  /** A Ref, not a constant: `rollbackThread` forks onto a NEW Muse session
+   * (MSP has no in-place rewind), and every later call on this thread must
+   * target that fork — see `rollbackThread`. */
+  readonly museSessionId: Ref.Ref<string>;
   readonly cwd: string | undefined;
   readonly viewCursor: Ref.Ref<string>;
   readonly activeTurnId: Ref.Ref<Option.Option<TurnId>>;
@@ -234,6 +233,49 @@ const itemTitle = (item: MspSchema.Item): string | undefined => {
 const itemDetail = (item: MspSchema.Item): string | undefined =>
   typeof item.fallbackText === "string" ? item.fallbackText : undefined;
 
+/** Defensively narrows a raw `SessionHistory.items` array to well-formed items. */
+const decodeHistoryItems = (raw: ReadonlyArray<unknown>): Array<MspSchema.Item> => {
+  const items: Array<MspSchema.Item> = [];
+  for (const entry of raw) {
+    if (typeof entry !== "object" || entry === null) continue;
+    const record = entry as Record<string, unknown>;
+    if (typeof record.itemId !== "string" || typeof record.kind !== "string") continue;
+    items.push(record as MspSchema.Item);
+  }
+  return items;
+};
+
+/**
+ * Distinct `turnId`s in first-appearance order. History items are served in
+ * fold order, so this is the session's chronological turn list. `userShell`
+ * items carry no turn (the one kind outside a turn per MSP) and are skipped.
+ */
+const orderedTurnIds = (items: ReadonlyArray<MspSchema.Item>): Array<string> => {
+  const seen = new Set<string>();
+  const ordered: Array<string> = [];
+  for (const item of items) {
+    const turnId = item.turnId;
+    if (typeof turnId !== "string" || seen.has(turnId)) continue;
+    seen.add(turnId);
+    ordered.push(turnId);
+  }
+  return ordered;
+};
+
+/** Groups items into `ProviderThreadSnapshot` turns; turn-less items go under a synthetic id. */
+const groupItemsByTurn = (
+  items: ReadonlyArray<MspSchema.Item>,
+): Array<{ readonly id: TurnId; readonly items: ReadonlyArray<unknown> }> => {
+  const byTurn = new Map<string, Array<MspSchema.Item>>();
+  for (const item of items) {
+    const key = typeof item.turnId === "string" ? item.turnId : "muse-outside-turn";
+    const bucket = byTurn.get(key);
+    if (bucket) bucket.push(item);
+    else byTurn.set(key, [item]);
+  }
+  return Array.from(byTurn, ([id, turnItems]) => ({ id: TurnId.make(id), items: turnItems }));
+};
+
 export interface MuseAdapterOptions {
   readonly binaryPath: string;
   readonly customModels: MuseSettings["customModels"];
@@ -321,6 +363,14 @@ export const makeMuseAdapter = Effect.fn("makeMuseAdapter")(function* (
                 },
                 raw: { source: "muse.msp.notification", payload: String(cause) },
               } as ProviderRuntimeEvent);
+              // LAST, after every emit above: closing `state.scope` interrupts
+              // this very fiber (it was forked into that scope), so any yield
+              // point after this line would unwind and silently drop its work.
+              // Same pattern as OpenCodeAdapter's session-exit teardown. This
+              // is what actually kills an orphaned `muse serve` whose
+              // connection died on a protocol-level parse/write error while
+              // the OS process itself is still alive.
+              yield* Scope.close(state.scope, Exit.void).pipe(Effect.ignore);
             }),
       ),
       Effect.forkIn(state.scope),
@@ -813,7 +863,7 @@ export const makeMuseAdapter = Effect.fn("makeMuseAdapter")(function* (
         threadId: input.threadId,
         scope,
         client,
-        museSessionId: startResult.session.sessionId,
+        museSessionId: yield* Ref.make(startResult.session.sessionId),
         cwd,
         viewCursor: yield* Ref.make(startResult.viewCursor),
         activeTurnId: yield* Ref.make(
@@ -835,17 +885,12 @@ export const makeMuseAdapter = Effect.fn("makeMuseAdapter")(function* (
         // before consuming live notifications: without this, deltas for an
         // already-in-flight agentMessage classify as "unknown" (dropped by
         // ingestion) until another lifecycle event happens to arrive.
-        const kindEntries: Array<readonly [string, string]> = [];
-        const historyItemRecords: Array<MspSchema.Item> = [];
-        for (const raw of startResult.historyItems) {
-          if (typeof raw !== "object" || raw === null) continue;
-          const record = raw as Record<string, unknown>;
-          if (typeof record.itemId !== "string" || typeof record.kind !== "string") continue;
-          kindEntries.push([record.itemId, record.kind]);
-          historyItemRecords.push(record as MspSchema.Item);
-        }
-        if (kindEntries.length > 0) {
-          yield* Ref.set(state.itemKindByItemId, new Map(kindEntries));
+        const historyItemRecords = decodeHistoryItems(startResult.historyItems);
+        if (historyItemRecords.length > 0) {
+          yield* Ref.set(
+            state.itemKindByItemId,
+            new Map(historyItemRecords.map((item) => [item.itemId, item.kind] as const)),
+          );
           yield* Ref.set(state.items, historyItemRecords);
         }
       }
@@ -859,7 +904,7 @@ export const makeMuseAdapter = Effect.fn("makeMuseAdapter")(function* (
         // notification that arrives meanwhile just queues (the incoming
         // queue is unbounded) until the consumer attaches.
         const pending = yield* client
-          .approvalListPending({ sessionId: state.museSessionId })
+          .approvalListPending({ sessionId: startResult.session.sessionId })
           .pipe(Effect.mapError(mapMspError(input.threadId, "approval/listPending")));
         yield* Ref.set(
           state.pendingApprovals,
@@ -970,7 +1015,10 @@ export const makeMuseAdapter = Effect.fn("makeMuseAdapter")(function* (
         ...base,
         type: "session.started",
         payload: {
-          resume: { schemaVersion: RESUME_CURSOR_VERSION, museSessionId: state.museSessionId },
+          resume: {
+            schemaVersion: RESUME_CURSOR_VERSION,
+            museSessionId: startResult.session.sessionId,
+          },
         },
       } as ProviderRuntimeEvent);
 
@@ -987,7 +1035,7 @@ export const makeMuseAdapter = Effect.fn("makeMuseAdapter")(function* (
         threadId: input.threadId,
         resumeCursor: {
           schemaVersion: RESUME_CURSOR_VERSION,
-          museSessionId: state.museSessionId,
+          museSessionId: startResult.session.sessionId,
         },
         createdAt: yield* nowIso,
         updatedAt: yield* nowIso,
@@ -999,6 +1047,7 @@ export const makeMuseAdapter = Effect.fn("makeMuseAdapter")(function* (
   ): Effect.Effect<ProviderTurnStartResult, ProviderAdapterError> =>
     Effect.gen(function* () {
       const state = yield* requireThread(input.threadId);
+      const museSessionId = yield* Ref.get(state.museSessionId);
       if (input.attachments && input.attachments.length > 0) {
         const base = yield* emitBase({ threadId: input.threadId });
         yield* emit({
@@ -1024,7 +1073,7 @@ export const makeMuseAdapter = Effect.fn("makeMuseAdapter")(function* (
             .sessionSetModel({
               commandId: setModelCommandId,
               model: { modelId: input.modelSelection.model },
-              sessionId: state.museSessionId,
+              sessionId: museSessionId,
             })
             .pipe(Effect.mapError(mapMspError(input.threadId, "session/setModel")));
           yield* Ref.set(state.modelId, input.modelSelection.model);
@@ -1035,14 +1084,14 @@ export const makeMuseAdapter = Effect.fn("makeMuseAdapter")(function* (
         .turnStart({
           commandId,
           input: [{ type: "text", text: input.input }],
-          sessionId: state.museSessionId,
+          sessionId: museSessionId,
         })
         .pipe(Effect.mapError(mapMspError(input.threadId, "turn/start")));
 
       return {
         threadId: input.threadId,
         turnId: TurnId.make(result.turnId),
-        resumeCursor: { schemaVersion: RESUME_CURSOR_VERSION, museSessionId: state.museSessionId },
+        resumeCursor: { schemaVersion: RESUME_CURSOR_VERSION, museSessionId },
       } satisfies ProviderTurnStartResult;
     });
 
@@ -1053,8 +1102,9 @@ export const makeMuseAdapter = Effect.fn("makeMuseAdapter")(function* (
     Effect.gen(function* () {
       const state = yield* requireThread(threadId);
       const commandId = yield* randomUuidV7;
+      const sessionId = yield* Ref.get(state.museSessionId);
       yield* state.client
-        .turnInterrupt({ commandId, sessionId: state.museSessionId, ...(turnId ? { turnId } : {}) })
+        .turnInterrupt({ commandId, sessionId, ...(turnId ? { turnId } : {}) })
         .pipe(Effect.mapError(mapMspError(threadId, "turn/interrupt")), Effect.asVoid);
     });
 
@@ -1183,8 +1233,9 @@ export const makeMuseAdapter = Effect.fn("makeMuseAdapter")(function* (
           Effect.all({
             runtimeMode: Ref.get(state.runtimeMode),
             activeTurnId: Ref.get(state.activeTurnId),
+            museSessionId: Ref.get(state.museSessionId),
           }).pipe(
-            Effect.map(({ runtimeMode, activeTurnId }): ProviderSession => ({
+            Effect.map(({ runtimeMode, activeTurnId, museSessionId }): ProviderSession => ({
               provider: PROVIDER,
               providerInstanceId: options.instanceId,
               // `runStopAll`'s continue-after-update path only resumes
@@ -1197,7 +1248,7 @@ export const makeMuseAdapter = Effect.fn("makeMuseAdapter")(function* (
               threadId: state.threadId,
               resumeCursor: {
                 schemaVersion: RESUME_CURSOR_VERSION,
-                museSessionId: state.museSessionId,
+                museSessionId,
               },
               createdAt: state.createdAt,
               updatedAt: state.createdAt,
@@ -1216,25 +1267,135 @@ export const makeMuseAdapter = Effect.fn("makeMuseAdapter")(function* (
     Effect.gen(function* () {
       const state = yield* requireThread(threadId);
       const items = yield* Ref.get(state.items);
-      return {
-        threadId,
-        // Best-effort: one synthetic turn holding every cached item, since
-        // this cache does not track turn boundaries. See module docs.
-        turns: [{ id: TurnId.make("muse-thread-snapshot"), items }],
-      } satisfies ProviderThreadSnapshot;
+      return { threadId, turns: groupItemsByTurn(items) } satisfies ProviderThreadSnapshot;
     });
 
+  /**
+   * MSP has no in-place rewind, but `session/fork` with a `cutPoint` copies
+   * the source history through a completed turn (inclusive) into a NEW
+   * session — semantically exactly a rollback, the same way T3's git
+   * checkpoints restore by moving to a new ref rather than rewriting one.
+   * After the fork this thread's `museSessionId` points at the fork; the
+   * source session is left intact on the host. The new id is surfaced
+   * through a fresh `session.started` (its `resume` cursor) and the next
+   * `sendTurn`'s `resumeCursor`, so a later resume lands on the fork.
+   */
   const rollbackThread = (
-    _threadId: ThreadId,
-    _numTurns: number,
+    threadId: ThreadId,
+    numTurns: number,
   ): Effect.Effect<ProviderThreadSnapshot, ProviderAdapterError> =>
-    Effect.fail(
-      new ProviderAdapterRequestError({
-        provider: PROVIDER,
-        method: "rollbackThread",
-        detail: "Muse does not expose conversation rollback over MSP v1.",
-      }),
-    );
+    Effect.gen(function* () {
+      if (!Number.isInteger(numTurns) || numTurns < 1) {
+        return yield* new ProviderAdapterValidationError({
+          provider: PROVIDER,
+          operation: "rollbackThread",
+          issue: "numTurns must be an integer >= 1.",
+        });
+      }
+      const state = yield* requireThread(threadId);
+      if (Option.isSome(yield* Ref.get(state.activeTurnId))) {
+        return yield* new ProviderAdapterValidationError({
+          provider: PROVIDER,
+          operation: "rollbackThread",
+          issue: "Cannot rewind while a Muse turn is running; interrupt it first.",
+        });
+      }
+      const sourceSessionId = yield* Ref.get(state.museSessionId);
+
+      // Ask the host for the authoritative history (not the in-memory cache,
+      // which is best-effort and may miss items from before this process
+      // attached) to find the ordered list of turns that actually exist.
+      const read = yield* state.client
+        .sessionRead({ sessionId: sourceSessionId, excludeItems: false })
+        .pipe(Effect.mapError(mapMspError(threadId, "session/read")));
+      const historyItems = decodeHistoryItems(read.history.items ?? []);
+      const turnIds = orderedTurnIds(historyItems);
+      if (turnIds.length < numTurns) {
+        return yield* new ProviderAdapterValidationError({
+          provider: PROVIDER,
+          operation: "rollbackThread",
+          issue: `Cannot rewind ${numTurns} turn(s): this Muse session only has ${turnIds.length}.`,
+        });
+      }
+      // The last turn to KEEP; undefined means "keep nothing" — but MSP's
+      // omitted `cutPoint` means "all completed turns", the opposite, so an
+      // empty result needs the earliest turn's predecessor, which doesn't
+      // exist. Rewinding the whole conversation is out of scope.
+      const keepThroughTurnId = turnIds[turnIds.length - numTurns - 1];
+      if (keepThroughTurnId === undefined) {
+        return yield* new ProviderAdapterValidationError({
+          provider: PROVIDER,
+          operation: "rollbackThread",
+          issue: "Muse cannot rewind past the first turn of a session; start a new thread instead.",
+        });
+      }
+
+      const commandId = yield* randomUuidV7;
+      const forked = yield* state.client
+        .sessionFork({
+          commandId,
+          sessionId: sourceSessionId,
+          cutPoint: { lastTurnId: keepThroughTurnId },
+          excludeItems: false,
+        })
+        .pipe(Effect.mapError(mapMspError(threadId, "session/fork")));
+
+      // Retarget every later call on this thread at the fork, and re-apply
+      // per-session settings the fork does not inherit from its source.
+      yield* Ref.set(state.museSessionId, forked.session.sessionId);
+      yield* Ref.set(state.viewCursor, forked.viewCursor);
+      yield* Ref.set(state.activeTurnId, Option.none());
+      yield* Ref.set(state.pendingApprovals, new Map());
+      yield* Ref.set(state.pendingUserInputs, new Map());
+      yield* Ref.set(state.pendingAnsweredUserInputs, new Map());
+      const forkItems = decodeHistoryItems(forked.history.items ?? []);
+      yield* Ref.set(state.items, forkItems);
+      yield* Ref.set(
+        state.itemKindByItemId,
+        new Map(forkItems.map((item) => [item.itemId, item.kind] as const)),
+      );
+      const approvalMode = runtimeModeToApprovalMode(yield* Ref.get(state.runtimeMode));
+      yield* state.client
+        .sessionSetApprovalMode({
+          commandId: yield* randomUuidV7,
+          sessionId: forked.session.sessionId,
+          mode: approvalMode,
+        })
+        .pipe(Effect.mapError(mapMspError(threadId, "session/setApprovalMode")));
+      const modelId = yield* Ref.get(state.modelId);
+      if (modelId) {
+        yield* state.client
+          .sessionSetModel({
+            commandId: yield* randomUuidV7,
+            model: { modelId },
+            sessionId: forked.session.sessionId,
+          })
+          .pipe(Effect.mapError(mapMspError(threadId, "session/setModel")));
+      }
+
+      // Persistence of the new resume cursor happens on the NEXT `sendTurn`
+      // (its `ProviderTurnStartResult.resumeCursor` is what ProviderService
+      // upserts), reading the Ref just retargeted above. Until then a
+      // server restart would resume the source session, i.e. the rewind is
+      // only durable once the user continues on the fork — the same
+      // "uncommitted until the next turn" semantics as the in-memory
+      // conversation state itself. This `session.started` is the
+      // informational marker that the underlying session was replaced.
+      const base = yield* emitBase({ threadId });
+      yield* emit({
+        ...base,
+        type: "session.started",
+        payload: {
+          message: `Rewound ${numTurns} turn(s) by forking the Muse session.`,
+          resume: {
+            schemaVersion: RESUME_CURSOR_VERSION,
+            museSessionId: forked.session.sessionId,
+          },
+        },
+      } as ProviderRuntimeEvent);
+
+      return { threadId, turns: groupItemsByTurn(forkItems) } satisfies ProviderThreadSnapshot;
+    });
 
   const stopAll = (): Effect.Effect<void, ProviderAdapterError> =>
     Ref.get(threads).pipe(
@@ -1248,7 +1409,8 @@ export const makeMuseAdapter = Effect.fn("makeMuseAdapter")(function* (
     capabilities: {
       sessionModelSwitch: "in-session",
       promptlessTurnContinuation: false,
-      supportsConversationRollback: false,
+      // Via `session/fork` with a cut point; see `rollbackThread`.
+      supportsConversationRollback: true,
     },
     compaction: {
       type: "native",
@@ -1256,8 +1418,9 @@ export const makeMuseAdapter = Effect.fn("makeMuseAdapter")(function* (
         Effect.gen(function* () {
           const state = yield* requireThread(threadId);
           const commandId = yield* randomUuidV7;
+          const sessionId = yield* Ref.get(state.museSessionId);
           const result = yield* state.client
-            .sessionCompact({ commandId, sessionId: state.museSessionId })
+            .sessionCompact({ commandId, sessionId })
             .pipe(Effect.mapError(mapMspError(threadId, "session/compact")));
           const base = yield* emitBase({ threadId });
           // `ProviderService`/runtime ingestion complete a compaction request

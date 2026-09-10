@@ -91,6 +91,20 @@ export interface SessionResumeParams {
   readonly sessionId: string;
 }
 
+export interface SessionReadParams {
+  /** Default `true` here (metadata-only); `false` carries the folded item history. */
+  readonly excludeItems?: boolean;
+  readonly sessionId: string;
+}
+
+export interface SessionForkParams {
+  readonly commandId: string;
+  /** Copy history through this completed turn, inclusive. Omitted = all completed turns. */
+  readonly cutPoint?: { readonly lastTurnId: string };
+  readonly excludeItems?: boolean;
+  readonly sessionId: string;
+}
+
 export interface SessionSetModelParams {
   readonly commandId: string;
   readonly model: ModelSelectionInput;
@@ -269,6 +283,14 @@ export const SessionResumeResult = Schema.Struct({
   viewCursor: Schema.String,
 });
 export type SessionResumeResult = typeof SessionResumeResult.Type;
+
+/** `session/read` result: same envelope as resume, but a point-in-time read (no subscription). */
+export const SessionReadResult = SessionResumeResult;
+export type SessionReadResult = typeof SessionReadResult.Type;
+
+/** `session/fork` result: the `session/resume` envelope for the NEW session. */
+export const SessionForkResult = SessionResumeResult;
+export type SessionForkResult = typeof SessionForkResult.Type;
 
 export const TurnStartResult = Schema.Struct({
   commandId: Schema.String,

@@ -63,6 +63,14 @@ export interface MspPatchedProtocol {
     method: string,
     payload?: unknown,
   ) => Effect.Effect<unknown, MspError.MspError>;
+  /** Fire-and-forget JSON-RPC notification (no `id`, no response). */
+  readonly notify: (method: string, payload?: unknown) => Effect.Effect<void, MspError.MspError>;
+}
+
+interface OutgoingEntry {
+  readonly encoded: string;
+  /** Set for request frames only; notifications are always written. */
+  readonly requestId?: string;
 }
 
 interface MspPendingRequest {
@@ -119,7 +127,10 @@ const normalizeError = (
 export const makeMspPatchedProtocol = Effect.fn("makeMspPatchedProtocol")(function* (
   options: MspPatchedProtocolOptions,
 ): Effect.fn.Return<MspPatchedProtocol, never, Scope.Scope> {
-  const outgoing = yield* Queue.unbounded<string, Cause.Done<void>>();
+  // Each entry carries the request id it belongs to (if any) so the writer
+  // can skip a request whose caller already gave up (timeout/interrupt)
+  // before the line was written — see the filter on the writer fiber.
+  const outgoing = yield* Queue.unbounded<OutgoingEntry, Cause.Done<void>>();
   // Unbounded and lossless: MuseAdapter derives item/approval state from these
   // notifications, so a sliding/dropping buffer could silently lose content
   // a consumer never gets a chance to recover.
@@ -170,7 +181,7 @@ export const makeMspPatchedProtocol = Effect.fn("makeMspPatchedProtocol")(functi
       ] as const;
     }).pipe(Effect.flatten);
 
-  const offerOutgoing = (message: Record<string, unknown>) =>
+  const offerOutgoing = (message: Record<string, unknown>, requestId?: string) =>
     Effect.gen(function* () {
       const failure = yield* Ref.get(terminationFailure);
       if (Option.isSome(failure)) return yield* failure.value;
@@ -178,7 +189,10 @@ export const makeMspPatchedProtocol = Effect.fn("makeMspPatchedProtocol")(functi
       yield* logProtocol({ direction: "outgoing", stage: "decoded", payload: message });
       const encoded = yield* encodeWireMessage(message);
       yield* logProtocol({ direction: "outgoing", stage: "raw", payload: encoded });
-      const accepted = yield* Queue.offer(outgoing, encoded);
+      const accepted = yield* Queue.offer(outgoing, {
+        encoded,
+        ...(requestId !== undefined ? { requestId } : {}),
+      });
       if (!accepted) {
         const closed = yield* Ref.get(terminationFailure);
         return yield* Option.getOrElse(closed, () => new MspError.MspInputStreamEndedError({}));
@@ -301,26 +315,38 @@ export const makeMspPatchedProtocol = Effect.fn("makeMspPatchedProtocol")(functi
     Effect.forkScoped,
   );
 
-  yield* Stream.fromQueue(outgoing).pipe(
-    Stream.run(options.stdio.stdout()),
+  // One explicit take → check → write loop rather than a Stream pipeline:
+  // stream stages buffer between each other, so a filter placed upstream of
+  // the sink would be evaluated for an entry long before the sink actually
+  // writes it, and a caller who gives up in between would still be sent.
+  // Checking `pending` immediately before each write is what closes that
+  // gap for a request whose caller already gave up (timeout/interrupt).
+  // A request already written is past this point and has an uncertain
+  // outcome by nature — that part is inherent to the protocol.
+  const writeOne = (entry: OutgoingEntry) =>
+    Effect.gen(function* () {
+      const requestId = entry.requestId;
+      if (requestId !== undefined) {
+        const live = (yield* Ref.get(pending)).has(requestId);
+        if (!live) return;
+      }
+      yield* Stream.make(entry.encoded).pipe(Stream.run(options.stdio.stdout()));
+    });
+  yield* Effect.forever(Queue.take(outgoing).pipe(Effect.flatMap(writeOne))).pipe(
     Effect.catchCause((cause) =>
-      handleTermination(() =>
-        Effect.succeed(normalizeError(Cause.squash(cause), "write-output-stream")),
-      ),
+      // `Queue.end(outgoing)` on termination surfaces as a `Done` failure
+      // from `Queue.take` — that is a normal shutdown, not a write error.
+      Cause.isDone(Cause.squash(cause))
+        ? Effect.void
+        : handleTermination(() =>
+            Effect.succeed(normalizeError(Cause.squash(cause), "write-output-stream")),
+          ),
     ),
     Effect.forkScoped,
   );
 
   const requestTimeoutMs = options.requestTimeoutMs ?? DEFAULT_REQUEST_TIMEOUT_MS;
 
-  // Known limitation: `outgoing` is a plain queue with no cancellation
-  // tracking. A request that times out or is interrupted after its encoded
-  // line has already been enqueued (e.g. the writer is blocked on a stalled
-  // stdout pipe) is still written once the writer unblocks — the pending-map
-  // entry is removed so no caller ever sees the (late) response, but the
-  // host still receives it. Fully closing this would need per-entry
-  // cancellation state threaded through the outgoing queue; deferred as a
-  // larger change, not attempted as part of adding the deadline above.
   const request = (method: string, payload?: unknown) =>
     Effect.gen(function* () {
       const requestId = yield* Ref.modify(
@@ -337,12 +363,15 @@ export const makeMspPatchedProtocol = Effect.fn("makeMspPatchedProtocol")(functi
           new Map(current).set(String(requestId), { deferred, method }),
         ),
         () =>
-          offerOutgoing({
-            jsonrpc: "2.0",
-            id: requestId,
-            method,
-            ...(payload !== undefined ? { params: payload } : {}),
-          }).pipe(Effect.andThen(Deferred.await(deferred))),
+          offerOutgoing(
+            {
+              jsonrpc: "2.0",
+              id: requestId,
+              method,
+              ...(payload !== undefined ? { params: payload } : {}),
+            },
+            String(requestId),
+          ).pipe(Effect.andThen(Deferred.await(deferred))),
         () => removePending(String(requestId)),
       ).pipe(
         Effect.timeoutOrElse({
@@ -363,5 +392,11 @@ export const makeMspPatchedProtocol = Effect.fn("makeMspPatchedProtocol")(functi
   return {
     incomingNotifications: Stream.fromQueue(incomingNotifications),
     request,
+    notify: (method, payload) =>
+      offerOutgoing({
+        jsonrpc: "2.0",
+        method,
+        ...(payload !== undefined ? { params: payload } : {}),
+      }),
   } satisfies MspPatchedProtocol;
 });

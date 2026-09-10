@@ -1,4 +1,5 @@
 import * as Cause from "effect/Cause";
+import * as Deferred from "effect/Deferred";
 import * as Effect from "effect/Effect";
 import * as Queue from "effect/Queue";
 import * as Sink from "effect/Sink";
@@ -30,10 +31,14 @@ export const makeChildStdio = Effect.fn("makeChildStdio")(function* (
   });
 });
 
-export const makeInMemoryStdio = Effect.fn("makeInMemoryStdio")(function* () {
+export const makeInMemoryStdio = Effect.fn("makeInMemoryStdio")(function* (options?: {
+  /** Test-only: every write to `stdout` awaits this first, simulating a blocked pipe. */
+  readonly writeGate?: Deferred.Deferred<void>;
+}) {
   const input = yield* Queue.unbounded<Uint8Array, Cause.Done<void>>();
   const output = yield* Queue.unbounded<string>();
   const decoder = new TextDecoder();
+  const gate = options?.writeGate;
 
   return {
     stdio: Stdio.make({
@@ -41,9 +46,13 @@ export const makeInMemoryStdio = Effect.fn("makeInMemoryStdio")(function* () {
       stdin: Stream.fromQueue(input),
       stdout: () =>
         Sink.forEach((chunk: string | Uint8Array) =>
-          Queue.offer(
-            output,
-            typeof chunk === "string" ? chunk : decoder.decode(chunk, { stream: true }),
+          (gate ? Deferred.await(gate) : Effect.void).pipe(
+            Effect.andThen(
+              Queue.offer(
+                output,
+                typeof chunk === "string" ? chunk : decoder.decode(chunk, { stream: true }),
+              ),
+            ),
           ),
         ),
       stderr: () => Sink.drain,

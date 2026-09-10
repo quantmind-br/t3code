@@ -9,6 +9,7 @@
  */
 import { type ModelSelection, type MuseSettings, TextGenerationError } from "@t3tools/contracts";
 import * as Effect from "effect/Effect";
+import * as FileSystem from "effect/FileSystem";
 import * as Fiber from "effect/Fiber";
 import * as Deferred from "effect/Deferred";
 import * as Ref from "effect/Ref";
@@ -48,15 +49,16 @@ export const makeMuseTextGeneration = Effect.fn("makeMuseTextGeneration")(functi
   environment: NodeJS.ProcessEnv = process.env,
 ) {
   const spawner = yield* ChildProcessSpawner.ChildProcessSpawner;
+  const fs = yield* FileSystem.FileSystem;
 
   const runMuseJson = <S extends Schema.Top>({
     operation,
-    cwd,
     prompt,
     outputSchemaJson,
     modelSelection,
   }: {
     operation: MuseTextGenerationOperation;
+    /** Accepted for interface parity; the child never runs in it (see isolatedCwd). */
     cwd: string;
     prompt: string;
     outputSchemaJson: S;
@@ -64,11 +66,27 @@ export const makeMuseTextGeneration = Effect.fn("makeMuseTextGeneration")(functi
   }): Effect.Effect<S["Type"], TextGenerationError, S["DecodingServices"]> =>
     Effect.gen(function* () {
       const command = museSettings.binaryPath || "muse";
-      // Deliberately no `--trust-workspace`: this session only ever answers
-      // from the prompt text built above (commit/PR/branch/title), never
-      // reads the actual repository, so an untrusted workspace plus
-      // `approvalMode: "denyUnmatched"` below is the tightest combination
-      // MSP v1 exposes for a one-shot, tool-free generation session.
+      // Process-level isolation, the strongest mitigation MSP v1 leaves open:
+      // `muse serve` runs in an empty scoped temp dir, NOT the user's repo,
+      // so even if a tool call slipped past `denyUnmatched` (below) it has
+      // nothing of the user's to read or modify. The prompt built above
+      // already carries every fact the model needs (diff/messages/title), and
+      // this session never reads the repository itself. `cwd` (the repo) is
+      // deliberately unused for the child process. The dir is removed with
+      // the scope. Same approach as AntigravityTextGeneration.
+      const isolatedCwd = yield* fs.makeTempDirectoryScoped({ prefix: "t3-muse-text-" }).pipe(
+        Effect.mapError(
+          (cause) =>
+            new TextGenerationError({
+              operation,
+              detail: "Failed to create an isolated working directory for Muse.",
+              cause,
+            }),
+        ),
+      );
+      // Deliberately no `--trust-workspace`: with an untrusted (and empty)
+      // workspace plus `approvalMode: "denyUnmatched"` below, this is the
+      // tightest combination MSP v1 exposes for a one-shot generation session.
       const spawnCommand = yield* resolveSpawnCommand(command, ["serve"], {
         env: environment,
         extendEnv: true,
@@ -87,7 +105,7 @@ export const makeMuseTextGeneration = Effect.fn("makeMuseTextGeneration")(functi
         command: spawnCommand.command,
         args: spawnCommand.args,
         env: environment,
-        cwd,
+        cwd: isolatedCwd,
         shell: spawnCommand.shell,
       }).pipe(
         Effect.provideService(ChildProcessSpawner.ChildProcessSpawner, spawner),
@@ -109,18 +127,17 @@ export const makeMuseTextGeneration = Effect.fn("makeMuseTextGeneration")(functi
       const started = yield* client
         .sessionStart({
           commandId,
-          workspaceRoot: cwd,
+          workspaceRoot: isolatedCwd,
           // One-shot metadata generation (commit message/PR body/branch/title)
           // must never execute workspace tools: there's no approval handler
           // attached to this session, and diff/message content is untrusted
-          // input an embedded instruction could target. Combined with no
-          // `--trust-workspace` above, `denyUnmatched` auto-denies anything
-          // requiring approval instead of hanging or silently running under a
-          // permissive local Muse config — note this is best-effort, not a
-          // verified tool-disable boundary: MSP v1 exposes no dedicated
-          // no-tools/isolated mode, so an operation matching an existing
-          // allow policy could still run. If MSP later exposes such a mode,
-          // this session should use it instead.
+          // input an embedded instruction could target. Combined with the
+          // isolated empty cwd and no `--trust-workspace` above, `denyUnmatched`
+          // auto-denies anything requiring approval instead of hanging or
+          // silently running under a permissive local Muse config. MSP v1's
+          // `ApprovalMode` is closed ("select, never create"), so there is no
+          // client-side way to declare a no-tools policy on the wire; the
+          // isolated cwd is what actually bounds the blast radius.
           approvalMode: "denyUnmatched",
           ...(modelSelection.model ? { modelId: modelSelection.model } : {}),
         })

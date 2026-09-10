@@ -1,3 +1,4 @@
+import * as Deferred from "effect/Deferred";
 import * as Effect from "effect/Effect";
 import * as Fiber from "effect/Fiber";
 import * as Queue from "effect/Queue";
@@ -67,6 +68,14 @@ it.effect("effect-msp client handshake and turn round trip", () =>
     );
     const initialized = yield* Fiber.join(initializeFiber);
     assert.equal(initialized.serverInfo.name, "muse");
+    // The client must follow a successful initialize with the `initialized`
+    // notification, or the host rejects every session/* call.
+    const initializedNotification = yield* Queue.take(output).pipe(Effect.flatMap(decodeJson));
+    assert.deepEqual(initializedNotification, {
+      jsonrpc: "2.0",
+      method: "initialized",
+      params: {},
+    });
 
     const sessionStartFiber = yield* Effect.forkScoped(client.sessionStart({ commandId: "cmd-1" }));
     const sessionStartRequest = yield* takeRequest(output);
@@ -180,5 +189,111 @@ it.effect("effect-msp client surfaces a JSON-RPC error as MspRequestError with i
       assert.equal(failure.kind, "approvalChoiceInvalid");
       assert.equal(failure.code, -32052);
     }
+  }),
+);
+
+it.effect(
+  "effect-msp client does not write a request that timed out while the writer was blocked",
+  () =>
+    Effect.gen(function* () {
+      const writeGate = yield* Deferred.make<void>();
+      const { stdio, output } = yield* makeInMemoryStdio({ writeGate });
+      const client = yield* MspClient.makeOverStdio(stdio, { requestTimeoutMs: 1_000 });
+
+      // Both requests are enqueued while the pipe is blocked. Only the first is
+      // allowed to live long enough to be written; the second gives up first.
+      const firstFiber = yield* Effect.forkScoped(
+        client.turnStart({
+          commandId: "cmd-a",
+          input: [{ type: "text", text: "a" }],
+          sessionId: "s",
+        }),
+      );
+      const secondFiber = yield* Effect.forkScoped(
+        client.turnStart({
+          commandId: "cmd-b",
+          input: [{ type: "text", text: "b" }],
+          sessionId: "s",
+        }),
+      );
+      // Let both requests reach the outgoing queue before expiring anything.
+      yield* TestClock.adjust("10 millis");
+      // Interrupt the second caller (equivalent to it timing out) while the
+      // writer is still blocked on the first line.
+      yield* Fiber.interrupt(secondFiber);
+      yield* Deferred.succeed(writeGate, undefined);
+
+      const firstRequest = yield* takeRequest(output);
+      assert.equal((firstRequest.params as { commandId: string }).commandId, "cmd-a");
+      // Let the writer drain whatever else it is going to write.
+      yield* TestClock.adjust("10 millis");
+      const leftover = yield* Queue.size(output);
+      assert.equal(leftover, 0, "the cancelled request must not have been written");
+
+      yield* Fiber.interrupt(firstFiber);
+    }),
+);
+
+it.effect("effect-msp client session/fork round trip carries the fork's session and history", () =>
+  Effect.gen(function* () {
+    const { stdio, input, output } = yield* makeInMemoryStdio();
+    const client = yield* MspClient.makeOverStdio(stdio);
+
+    const forkFiber = yield* Effect.forkScoped(
+      client.sessionFork({
+        commandId: "cmd-fork",
+        sessionId: "session-1",
+        cutPoint: { lastTurnId: "turn-1" },
+        excludeItems: false,
+      }),
+    );
+    const forkRequest = yield* takeRequest(output);
+    assert.equal(forkRequest.method, "session/fork");
+    assert.deepEqual(forkRequest.params, {
+      commandId: "cmd-fork",
+      sessionId: "session-1",
+      cutPoint: { lastTurnId: "turn-1" },
+      excludeItems: false,
+    });
+    yield* Queue.offer(
+      input,
+      encodeJsonl({
+        id: forkRequest.id,
+        result: {
+          history: {
+            items: [
+              { itemId: "i-1", kind: "userMessage", turnId: "turn-1" },
+              { itemId: "i-2", kind: "agentMessage", turnId: "turn-1", text: "hi" },
+            ],
+            mode: "inline",
+            snapshot: null,
+          },
+          pendingRequests: [],
+          session: {
+            activeTurnId: null,
+            createdAt: "2026-01-01T00:00:01Z",
+            forkedFrom: {
+              commandId: "cmd-fork",
+              cutCursor: "opaque",
+              cutExplicit: true,
+              sessionId: "session-1",
+            },
+            modelId: null,
+            path: "/tmp/session-2.jsonl",
+            providerId: null,
+            sessionId: "session-2",
+            status: "idle",
+            turnCount: 1,
+            updatedAt: "2026-01-01T00:00:01Z",
+            workspaceRoot: "/tmp/work",
+          },
+          viewCursor: "v:1:0",
+        },
+      }),
+    );
+    const forked = yield* Fiber.join(forkFiber);
+    assert.equal(forked.session.sessionId, "session-2");
+    assert.equal(forked.history.items?.length, 2);
+    assert.equal(forked.viewCursor, "v:1:0");
   }),
 );

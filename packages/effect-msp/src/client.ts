@@ -70,6 +70,12 @@ export interface MspClient {
   readonly sessionResume: (
     params: MspSchema.SessionResumeParams,
   ) => Effect.Effect<MspSchema.SessionResumeResult, MspError.MspError>;
+  readonly sessionRead: (
+    params: MspSchema.SessionReadParams,
+  ) => Effect.Effect<MspSchema.SessionReadResult, MspError.MspError>;
+  readonly sessionFork: (
+    params: MspSchema.SessionForkParams,
+  ) => Effect.Effect<MspSchema.SessionForkResult, MspError.MspError>;
   readonly sessionSetModel: (
     params: MspSchema.SessionSetModelParams,
   ) => Effect.Effect<MspSchema.SessionSetModelResult, MspError.MspError>;
@@ -141,9 +147,18 @@ export const makeOverStdio = Effect.fn("effect-msp/makeOverStdio")(function* (
       method: notification.method,
       params: notification.params,
     })),
-    initialize: (params) => call("initialize", MspSchema.InitializeResult, params),
+    // The host gates every session/* method behind the client's `initialized`
+    // notification (not just a successful `initialize` result) — without it,
+    // `session/start` fails with `notInitialized`. Sending it here keeps the
+    // handshake a single call for every consumer.
+    initialize: (params) =>
+      call("initialize", MspSchema.InitializeResult, params).pipe(
+        Effect.tap(() => protocol.notify("initialized", {})),
+      ),
     sessionStart: (params) => call("session/start", MspSchema.SessionStartResult, params),
     sessionResume: (params) => call("session/resume", MspSchema.SessionResumeResult, params),
+    sessionRead: (params) => call("session/read", MspSchema.SessionReadResult, params),
+    sessionFork: (params) => call("session/fork", MspSchema.SessionForkResult, params),
     sessionSetModel: (params) => call("session/setModel", MspSchema.SessionSetModelResult, params),
     sessionSetApprovalMode: (params) =>
       call("session/setApprovalMode", MspSchema.SessionSetApprovalModeResult, params),
