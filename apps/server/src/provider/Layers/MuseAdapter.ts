@@ -110,6 +110,14 @@ const RESUME_CURSOR_VERSION = 1 as const;
 const VIEW_GAP_PAGE_LIMIT = 200;
 const VIEW_GAP_MAX_PAGES = 25;
 
+/**
+ * How many recently dispatched view cursors a thread remembers. Only needs to
+ * outlast a gap bracket, and one bracket is bounded by the recovery budget
+ * above (200 x 25), so this covers a worst-case gap twice over while keeping
+ * the set trivially small for a long session.
+ */
+const DISPATCHED_CURSOR_MEMORY = 10_000;
+
 interface MuseResumeCursor {
   readonly schemaVersion: typeof RESUME_CURSOR_VERSION;
   readonly museSessionId: string;
@@ -183,6 +191,20 @@ interface MuseThreadState {
   /** Task rows already closed, so a terminal item re-emitted at a higher
    * revision does not report a second completion. */
   readonly completedTaskIds: Ref.Ref<Set<string>>;
+  /** Highest item revision already projected onto a task row, per item id, so
+   * a stale revision arriving after a newer one (recovery racing the live
+   * stream) cannot walk the task backwards. */
+  readonly taskItemRevision: Ref.Ref<Map<string, number>>;
+  /** Bounded FIFO of view cursors this thread already dispatched. `view/gap`
+   * recovery stops at the first one it meets: that proves the walk reached
+   * territory the live stream already delivered. Insertion-ordered, capped at
+   * `DISPATCHED_CURSOR_MEMORY` so a long session cannot grow it without
+   * bound. */
+  readonly dispatchedViewCursors: Ref.Ref<Set<string>>;
+  /** Characters of each item's streamed field already published, so a durable
+   * re-emission (notably a `view/gap` fill) can publish only the suffix the
+   * ephemeral delta stream never delivered. */
+  readonly streamedContentChars: Ref.Ref<Map<string, number>>;
   readonly createdAt: string;
   readonly runtimeMode: Ref.Ref<RuntimeMode>;
   readonly modelId: Ref.Ref<string | undefined>;
@@ -658,6 +680,23 @@ export const makeMuseAdapter = Effect.fn("makeMuseAdapter")(function* (
       const failure = optionalText(item.failureReason);
       const summary = optionalText(item.message) ?? optionalText(item.fallbackText);
 
+      // MSP's apply rule for items is replace-iff-higher on `revision`, and a
+      // `view/gap` fill runs interleaved with the live stream, so a stale
+      // revision can arrive after a newer one. Dropping it here is what stops
+      // an older `inProgress` revision from reopening a task the newer
+      // terminal revision already closed — which would otherwise leave the row
+      // stuck running forever, since its completion is deduped away.
+      const revision = optionalNonNegativeInt(item.revision);
+      const isStale = yield* Ref.modify(state.taskItemRevision, (current) => {
+        if (revision === undefined) return [false, current] as const;
+        const seen = current.get(item.itemId);
+        if (seen !== undefined && revision < seen) return [true, current] as const;
+        const next = new Map(current);
+        next.set(item.itemId, revision);
+        return [false, next] as const;
+      });
+      if (isStale) return;
+
       const alreadyStarted = yield* Ref.modify(state.emittedTaskIds, (current) => {
         if (current.has(item.itemId)) return [true, current] as const;
         const next = new Set(current);
@@ -672,7 +711,9 @@ export const makeMuseAdapter = Effect.fn("makeMuseAdapter")(function* (
         });
       }
 
-      const terminal = method === "item/completed" || TERMINAL_TASK_STATUSES.has(status);
+      const alreadyClosed = (yield* Ref.get(state.completedTaskIds)).has(item.itemId);
+      const terminal =
+        alreadyClosed || method === "item/completed" || TERMINAL_TASK_STATUSES.has(status);
       if (!terminal) {
         yield* emitTask({
           type: "task.progress",
@@ -696,25 +737,50 @@ export const makeMuseAdapter = Effect.fn("makeMuseAdapter")(function* (
         { concurrency: 1, discard: true },
       );
 
-      if (terminal) {
-        const closed = yield* Ref.modify(state.completedTaskIds, (current) => {
-          if (current.has(item.itemId)) return [true, current] as const;
-          const next = new Set(current);
-          next.add(item.itemId);
-          return [false, next] as const;
-        });
-        if (closed) return;
+      if (!terminal) return;
+      yield* Ref.update(state.completedTaskIds, (current) => {
+        if (current.has(item.itemId)) return current;
+        const next = new Set(current);
+        next.add(item.itemId);
+        return next;
+      });
+      if (alreadyClosed) {
+        // The row is already closed, but a higher terminal revision can still
+        // carry a final summary or failure reason the first one lacked.
+        // `task.updated` forwards that without reporting a second lifecycle
+        // transition or reopening the task.
+        //
+        // Usage is deliberately NOT forwarded here: `TaskUpdatedPayload` has no
+        // usage field, and the only payloads that do (`task.progress`,
+        // `task.completed`) would respectively reopen or re-close the row. A
+        // late-arriving usage-only revision is therefore dropped rather than
+        // faked through a lifecycle transition that did not happen.
+        const enrichment = {
+          ...((summary ?? failure) ? { description: summary ?? failure } : {}),
+          ...(failure ? { error: failure } : {}),
+        };
+        if (Object.keys(enrichment).length === 0) return;
         yield* emitTask({
-          type: "task.completed",
+          type: "task.updated",
           payload: {
             taskId,
-            status: toCompletedStatus(status),
-            ...((summary ?? failure) ? { summary: summary ?? failure } : {}),
-            ...(usage ? { typedUsage: usage } : {}),
+            status,
+            ...enrichment,
             ...linkage,
           },
         });
+        return;
       }
+      yield* emitTask({
+        type: "task.completed",
+        payload: {
+          taskId,
+          status: toCompletedStatus(status),
+          ...((summary ?? failure) ? { summary: summary ?? failure } : {}),
+          ...(usage ? { typedUsage: usage } : {}),
+          ...linkage,
+        },
+      });
     });
 
   /**
@@ -777,7 +843,12 @@ export const makeMuseAdapter = Effect.fn("makeMuseAdapter")(function* (
         });
       }
 
-      if (!TERMINAL_TASK_STATUSES.has(status)) {
+      // Same closed-row rule as the parent: once a child row is terminal, a
+      // re-emitted non-terminal state must not reopen it. A workflow item is
+      // re-emitted whole on every change, so an already-finished child rides
+      // along on every later revision.
+      const alreadyClosed = (yield* Ref.get(state.completedTaskIds)).has(childKey);
+      if (!alreadyClosed && !TERMINAL_TASK_STATUSES.has(status)) {
         yield* emitTask({
           type: "task.progress",
           payload: {
@@ -790,20 +861,38 @@ export const makeMuseAdapter = Effect.fn("makeMuseAdapter")(function* (
         });
         return;
       }
+      if (!TERMINAL_TASK_STATUSES.has(status)) return;
 
-      const closed = yield* Ref.modify(state.completedTaskIds, (current) => {
-        if (current.has(childKey)) return [true, current] as const;
+      yield* Ref.update(state.completedTaskIds, (current) => {
+        if (current.has(childKey)) return current;
         const next = new Set(current);
         next.add(childKey);
-        return [false, next] as const;
+        return next;
       });
-      if (closed) return;
+      const summary = optionalText(child.resultRef);
+      if (alreadyClosed) {
+        // Enrichment only, and only what `TaskUpdatedPayload` can express: a
+        // later revision may attach the child's result reference. Usage has no
+        // field on that payload (see the parent branch), so it is dropped
+        // rather than routed through a lifecycle event that did not happen.
+        if (summary === undefined) return;
+        yield* emitTask({
+          type: "task.updated",
+          payload: {
+            taskId,
+            status,
+            ...(summary ? { description: summary } : {}),
+            ...linkage,
+          },
+        });
+        return;
+      }
       yield* emitTask({
         type: "task.completed",
         payload: {
           taskId,
           status: toCompletedStatus(status),
-          ...(optionalText(child.resultRef) ? { summary: optionalText(child.resultRef) } : {}),
+          ...(summary ? { summary } : {}),
           ...(usage ? { typedUsage: usage } : {}),
           ...linkage,
         },
@@ -855,6 +944,104 @@ export const makeMuseAdapter = Effect.fn("makeMuseAdapter")(function* (
       Effect.forkIn(state.scope),
     );
 
+  /**
+   * Records one view notification's cursor as dispatched, evicting oldest-first
+   * past `DISPATCHED_CURSOR_MEMORY`. `Set` iterates in insertion order, which
+   * is the arrival order, which — cursors being strictly monotonic — is also
+   * cursor order, so the eviction always drops the oldest positions.
+   */
+  const rememberDispatchedCursor = (
+    state: MuseThreadState,
+    params: unknown,
+  ): Effect.Effect<void> => {
+    if (typeof params !== "object" || params === null) return Effect.void;
+    const viewCursor = (params as { readonly viewCursor?: unknown }).viewCursor;
+    if (typeof viewCursor !== "string" || viewCursor.length === 0) return Effect.void;
+    return Ref.update(state.dispatchedViewCursors, (current) => {
+      if (current.has(viewCursor)) return current;
+      const next = new Set(current);
+      next.add(viewCursor);
+      while (next.size > DISPATCHED_CURSOR_MEMORY) {
+        const oldest = next.values().next();
+        if (oldest.done === true) break;
+        next.delete(oldest.value);
+      }
+      return next;
+    });
+  };
+
+  /** Records how many characters of an item's streamed field already shipped. */
+  const noteStreamedContent = (
+    state: MuseThreadState,
+    itemId: string,
+    delta: string,
+  ): Effect.Effect<void> =>
+    Ref.update(state.streamedContentChars, (current) =>
+      new Map(current).set(itemId, (current.get(itemId) ?? 0) + delta.length),
+    );
+
+  /**
+   * MSP splits an item's visible text across two surfaces: the durable item
+   * carries the accumulated value, and `item/delta` streams it. Only the
+   * stream reaches ingestion normally — but `item/delta` is ephemeral and
+   * `view/page` serves durable events only, so a `view/gap` fill recovers the
+   * item without a single character of its text.
+   *
+   * These fields are append-only per MSP's own delta contract (a delta appends
+   * by field path), so the missing part is exactly the suffix past what the
+   * stream already delivered. Emitting that suffix is a no-op on the live path
+   * (where the counter already equals the full length) and is what actually
+   * restores a dropped reply after a gap.
+   *
+   * `reasoning.summary` is deliberately not reconciled: it is an array whose
+   * parts stream under per-index field paths, so a single character counter
+   * cannot place the suffix, and reasoning is never the model's answer.
+   */
+  const DURABLE_CONTENT_FIELD: Record<string, "text" | "visibleOutput"> = {
+    agentMessage: "text",
+    toolCall: "visibleOutput",
+    userShell: "visibleOutput",
+  };
+
+  const DURABLE_CONTENT_STREAM_KIND: Record<string, "assistant_text" | "command_output"> = {
+    agentMessage: "assistant_text",
+    toolCall: "command_output",
+    userShell: "command_output",
+  };
+
+  const reconcileItemContent = (
+    state: MuseThreadState,
+    item: MspSchema.Item,
+    base: Record<string, unknown>,
+    activeTurnId: Option.Option<TurnId>,
+  ): Effect.Effect<void> =>
+    Effect.gen(function* () {
+      const field = DURABLE_CONTENT_FIELD[item.kind];
+      if (field === undefined) return;
+      const full = item[field];
+      if (typeof full !== "string" || full.length === 0) return;
+
+      const missing = yield* Ref.modify(state.streamedContentChars, (current) => {
+        const streamed = current.get(item.itemId) ?? 0;
+        if (streamed >= full.length) return ["", current] as const;
+        const next = new Map(current);
+        next.set(item.itemId, full.length);
+        return [full.slice(streamed), next] as const;
+      });
+      if (missing.length === 0) return;
+
+      yield* emit({
+        ...base,
+        ...(Option.isSome(activeTurnId) ? { turnId: activeTurnId.value } : {}),
+        itemId: RuntimeItemId.make(item.itemId),
+        type: "content.delta",
+        payload: {
+          streamKind: DURABLE_CONTENT_STREAM_KIND[item.kind] ?? "unknown",
+          delta: missing,
+        },
+      } as ProviderRuntimeEvent);
+    });
+
   const handleNotification = (
     state: MuseThreadState,
     notification: MspClient.MspNotification,
@@ -863,6 +1050,13 @@ export const makeMuseAdapter = Effect.fn("makeMuseAdapter")(function* (
       const base = yield* emitBase({ threadId: state.threadId });
       const decode = <A, I>(schema: Schema.Codec<A, I>) =>
         Schema.decodeUnknownEffect(schema)(notification.params).pipe(Effect.option);
+
+      // Remember this event's position before dispatching it. `view/gap`
+      // recovery uses the record as its second stop condition, so it has to
+      // cover every view notification — including kinds this adapter does not
+      // map — or the walk could run past the hole into delivered territory.
+      // `view/gap` itself carries no `viewCursor`, so it never lands here.
+      yield* rememberDispatchedCursor(state, notification.params);
 
       switch (notification.method) {
         case "turn/started": {
@@ -941,6 +1135,12 @@ export const makeMuseAdapter = Effect.fn("makeMuseAdapter")(function* (
               ...(itemDetail(item) ? { detail: itemDetail(item) } : {}),
             },
           } as ProviderRuntimeEvent);
+          // Durable text carried by the item itself, reconciled against what
+          // the ephemeral delta stream already delivered. Live this is a
+          // no-op; after a `view/gap` fill it is the only way the dropped
+          // reply text reaches ingestion at all, because `view/page` serves
+          // durable events only and `item/delta` is ephemeral.
+          yield* reconcileItemContent(state, item, base, activeTurnId);
           // Subagent/workflow items are delegated agent work, not tool rows:
           // mirror them onto the task lifecycle so they land in the Agents
           // surface with real identity, role, model and usage instead of only
@@ -978,6 +1178,9 @@ export const makeMuseAdapter = Effect.fn("makeMuseAdapter")(function* (
               delta: params.value.delta,
             },
           } as ProviderRuntimeEvent);
+          // Count what the stream has delivered for this item so a later
+          // durable re-emission only publishes the part that is missing.
+          yield* noteStreamedContent(state, params.value.itemId, params.value.delta);
           return;
         }
         case "approval/requested": {
@@ -1206,9 +1409,13 @@ export const makeMuseAdapter = Effect.fn("makeMuseAdapter")(function* (
     Effect.gen(function* () {
       const liveCursor = yield* Ref.get(state.viewCursor);
       const museSessionId = yield* Ref.get(state.museSessionId);
-      // `view/gap` carries the session it belongs to; a gap for some other
-      // session on this connection is not ours to fill.
-      const sessionId = gap.sessionId || museSessionId;
+      // A gap names the session whose subscription dropped events. After a
+      // rollback this thread is on a NEW session (MSP has no in-place rewind)
+      // while a gap for the source session can still be queued behind us:
+      // filling it would repopulate the replacement's item and task state and
+      // move its active turn. Only our own session's gaps are ours to fill.
+      if (gap.sessionId !== museSessionId) return;
+      const sessionId = museSessionId;
 
       let cursor: string | undefined = gap.after;
       let pages = 0;
@@ -1244,10 +1451,32 @@ export const makeMuseAdapter = Effect.fn("makeMuseAdapter")(function* (
         for (const event of page.value.events) {
           const eventCursor =
             typeof event.params.viewCursor === "string" ? event.params.viewCursor : undefined;
-          // Exclusive upper bound: `next` itself arrived live.
-          if (eventCursor !== undefined && eventCursor === gap.next) {
-            reachedNext = true;
-            break;
+          // Two exclusive upper bounds, both by cursor EQUALITY so cursors stay
+          // opaque:
+          //
+          //   1. `next` itself, which arrived live.
+          //   2. any cursor this thread already dispatched.
+          //
+          // (2) is what makes the walk safe when `next` names an ephemeral
+          // event (an `item/delta`) that `view/page` never serves and (1) can
+          // therefore never match. Without it the walk runs past the hole and
+          // re-dispatches events the live stream already delivered — replaying
+          // a `turn/completed` there would clear `activeTurnId` while the live
+          // events queued behind this fill are still waiting, stripping their
+          // turn association. Pages are ascending and contiguous and the hole
+          // is one contiguous bracket, so the first already-seen cursor proves
+          // the walk has reached delivered territory and everything beyond it
+          // was delivered too.
+          if (eventCursor !== undefined) {
+            if (eventCursor === gap.next) {
+              reachedNext = true;
+              break;
+            }
+            const alreadyDispatched = yield* Ref.get(state.dispatchedViewCursors);
+            if (alreadyDispatched.has(eventCursor)) {
+              reachedNext = true;
+              break;
+            }
           }
           yield* replayGapEvent(state, event);
           recovered += 1;
@@ -1495,6 +1724,9 @@ export const makeMuseAdapter = Effect.fn("makeMuseAdapter")(function* (
         itemKindByItemId: yield* Ref.make(new Map<string, string>()),
         emittedTaskIds: yield* Ref.make(new Set<string>()),
         completedTaskIds: yield* Ref.make(new Set<string>()),
+        taskItemRevision: yield* Ref.make(new Map<string, number>()),
+        dispatchedViewCursors: yield* Ref.make(new Set<string>()),
+        streamedContentChars: yield* Ref.make(new Map<string, number>()),
         createdAt: sessionCreatedAt,
         runtimeMode: yield* Ref.make(input.runtimeMode),
         modelId: yield* Ref.make(input.modelSelection?.model),
@@ -2039,6 +2271,12 @@ export const makeMuseAdapter = Effect.fn("makeMuseAdapter")(function* (
               // replacement's own start/completion events.
               yield* Ref.set(state.emittedTaskIds, new Set<string>());
               yield* Ref.set(state.completedTaskIds, new Set<string>());
+              yield* Ref.set(state.taskItemRevision, new Map<string, number>());
+              yield* Ref.set(state.streamedContentChars, new Map<string, number>());
+              // Cursors are per-session; a replacement session's cursors are a
+              // fresh sequence, so keeping the source's would let a gap fill
+              // stop on a cursor that never belonged to this session.
+              yield* Ref.set(state.dispatchedViewCursors, new Set<string>());
             }),
           );
 

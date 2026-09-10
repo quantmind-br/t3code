@@ -44,7 +44,13 @@ export const resolveMuseProfilePaths = (
 ): MuseProfilePaths | undefined => {
   const trimmed = homePath?.trim();
   if (!trimmed) return undefined;
-  const root = expandHomePath(trimmed);
+  // Absolute, always. The processes that consume these variables do not share
+  // a working directory — the adapter host runs in the project, text
+  // generation runs in an isolated temp dir, and the health probe runs in the
+  // server's cwd — so a relative `homePath` would silently give each of them a
+  // different account. XDG also specifies that relative XDG_* paths are
+  // invalid and must be ignored, which would fall back to the default account.
+  const root = NodePath.resolve(expandHomePath(trimmed));
   const configHome = NodePath.join(root, MUSE_PROFILE_CONFIG_DIRNAME);
   return {
     configHome,

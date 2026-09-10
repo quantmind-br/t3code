@@ -511,6 +511,26 @@ it.layer(museAdapterTestLayer)("MuseAdapter", (it) => {
         "both dropped items are spliced in, and the live one is not duplicated",
       );
 
+      // The whole point of recovering an `agentMessage` is its text, which
+      // only ever streams over the ephemeral `item/delta` channel `view/page`
+      // does not serve.
+      const recoveredText = events
+        .filter((event) => event.type === "content.delta")
+        .map((event) => [String(event.itemId), (event.payload as { delta: string }).delta]);
+      assert.deepEqual(recoveredText, [
+        ["item-missed-a", "recovered item-missed-a"],
+        ["item-missed-b", "recovered item-missed-b"],
+        ["item-live", "live"],
+      ]);
+
+      // Every emitted event must carry the real turn id, which only happens
+      // if `turn/started` actually decoded.
+      const turnIds = new Set(events.map((event) => String(event.turnId ?? "")));
+      assert.isTrue(
+        turnIds.has("22222222-2222-7222-8222-222222222222"),
+        "turn/started must decode so recovered items keep their turn association",
+      );
+
       // Real recovery replaces the old "some activity may be missing" warning.
       assert.isUndefined(
         events.find(
@@ -545,6 +565,133 @@ it.layer(museAdapterTestLayer)("MuseAdapter", (it) => {
       );
       // An exhausted-but-clean walk is not an error; nothing more was servable.
       assert.isUndefined(events.find((event) => event.type === "runtime.warning"));
+    }),
+  );
+
+  it.effect("stops a view/gap walk at already-delivered ground when next is ephemeral", () =>
+    Effect.gen(function* () {
+      // `next` names an `item/delta` cursor. `view/page` serves durable events
+      // only, so the walk can never match it and must stop on the first cursor
+      // this thread already dispatched instead of running past the hole.
+      const durable = (itemId: string, viewCursor: string) => ({
+        method: "item/completed",
+        params: {
+          sessionId: SESSION_ID,
+          viewCursor,
+          sourceRange: { from: 1, to: 1 },
+          item: {
+            itemId,
+            kind: "agentMessage",
+            revision: 1,
+            status: "completed",
+            turnId: "22222222-2222-7222-8222-222222222222",
+            text: itemId,
+          },
+        },
+      });
+
+      const host = yield* makeMockHost({
+        afterTurnStart: [
+          // Delivered live BEFORE the gap notification reaches the consumer.
+          {
+            method: "item/completed",
+            params: {
+              viewCursor: "cursor-after-hole",
+              sourceRange: { from: 5, to: 5 },
+              item: {
+                itemId: "item-after-hole",
+                kind: "agentMessage",
+                revision: 1,
+                status: "completed",
+                turnId: "22222222-2222-7222-8222-222222222222",
+                text: "after hole",
+              },
+            },
+          },
+          // The bracket flushes late, and its `next` is an ephemeral delta
+          // cursor that `view/page` will never return.
+          {
+            method: "view/gap",
+            params: { after: "cursor-1", next: "cursor-ephemeral-delta" },
+          },
+        ],
+        viewPages: {
+          "cursor-1": {
+            events: [durable("item-in-hole", "cursor-2")],
+            nextCursor: "cursor-2",
+          },
+          // Past the hole: this page is already-delivered ground and must not
+          // be replayed.
+          "cursor-2": {
+            events: [durable("item-after-hole", "cursor-after-hole")],
+            nextCursor: "cursor-after-hole",
+          },
+          "cursor-after-hole": { events: [], nextCursor: null },
+        },
+      });
+      const threadId = ThreadId.make("muse-view-gap-ephemeral-next");
+
+      const { events } = yield* withAdapter(host, threadId, (adapter) =>
+        adapter.sendTurn({ threadId, input: "go" }).pipe(Effect.orDie),
+      );
+
+      const completedIds = events
+        .filter((event) => event.type === "item.completed")
+        .map((event) => String(event.itemId));
+      assert.deepEqual(
+        completedIds,
+        ["item-after-hole", "item-in-hole"],
+        "the hole is filled once and the already-delivered event is not replayed",
+      );
+
+      // The walk must have stopped rather than paging to the end of the view.
+      const pageCursors = (yield* readRequests(host.requestLogPath))
+        .filter((request) => request.method === "view/page")
+        .map((request) => (request.params as { cursor?: string }).cursor);
+      assert.deepEqual(pageCursors, ["cursor-1", "cursor-2"]);
+
+      // Text must be published exactly once per item, never duplicated by the
+      // overlapping page.
+      const deltas = events
+        .filter((event) => event.type === "content.delta")
+        .map((event) => [String(event.itemId), (event.payload as { delta: string }).delta]);
+      assert.deepEqual(deltas, [
+        ["item-after-hole", "after hole"],
+        ["item-in-hole", "item-in-hole"],
+      ]);
+    }),
+  );
+
+  it.effect("ignores a view/gap that belongs to another session", () =>
+    Effect.gen(function* () {
+      const host = yield* makeMockHost({
+        afterTurnStart: [
+          {
+            method: "view/gap",
+            // Overrides the mock's own sessionId: a gap for a session this
+            // thread no longer runs (the shape a post-rollback queued gap has).
+            params: {
+              sessionId: "99999999-9999-7999-8999-999999999999",
+              after: "cursor-1",
+              next: "cursor-4",
+            },
+          },
+        ],
+        viewPages: {
+          "cursor-1": { events: [], nextCursor: null },
+        },
+      });
+      const threadId = ThreadId.make("muse-view-gap-foreign");
+
+      yield* withAdapter(host, threadId, (adapter) =>
+        adapter.sendTurn({ threadId, input: "go" }).pipe(Effect.orDie),
+      );
+
+      const requests = yield* readRequests(host.requestLogPath);
+      assert.isFalse(
+        requests.some((request) => request.method === "view/page"),
+        "a foreign session's gap must not page this session's view",
+      );
     }),
   );
 

@@ -73,6 +73,12 @@ const FIXED_TIMESTAMP = "1970-01-01T00:00:00.000Z";
 const SESSION_ID = "11111111-1111-7111-8111-111111111111";
 const TURN_ID = "22222222-2222-7222-8222-222222222222";
 
+/**
+ * The real host gates every `session/*` behind `guard_initialized`, which is
+ * only satisfied by the client's `initialized` NOTIFICATION after the
+ * `initialize` response — not by the response itself. Modelling that here is
+ * what makes this fixture able to catch a client that skips the handshake.
+ */
 let initialized = false;
 
 const handle = (request: JsonRpcRequest) => {
@@ -80,7 +86,11 @@ const handle = (request: JsonRpcRequest) => {
     NodeFS.appendFileSync(requestLogPath, `${JSON.stringify(request)}\n`, "utf8");
   }
   const { id, method, params = {} } = request;
-  if (id === undefined) return; // notification from the client
+  if (id === undefined) {
+    // Client notification. `initialized` is the one that opens the gate.
+    if (method === "initialized") initialized = true;
+    return;
+  }
 
   if (method !== "initialize" && !initialized) {
     fail(id, -32002, "not initialized", "notInitialized");
@@ -101,7 +111,8 @@ const handle = (request: JsonRpcRequest) => {
         serverInfo: { name: "msp-mock-host", version: "0.0.0" },
         userAgent: "msp-mock-host",
       });
-      initialized = true;
+      // Deliberately NOT setting `initialized` here: only the client's own
+      // `initialized` notification opens the gate, same as the real host.
       return;
 
     case "session/start":
@@ -133,6 +144,7 @@ const handle = (request: JsonRpcRequest) => {
         turnId: TURN_ID,
       });
       notify("turn/started", {
+        commandId: String(params.commandId ?? ""),
         sessionId: SESSION_ID,
         turnId: TURN_ID,
         viewCursor: "cursor-1",
@@ -162,7 +174,11 @@ const handle = (request: JsonRpcRequest) => {
     }
 
     case "turn/interrupt":
-      respond(id, { status: "accepted" });
+      respond(id, {
+        commandId: String(params.commandId ?? ""),
+        status: "accepted",
+        turnId: (params.turnId as string | undefined) ?? TURN_ID,
+      });
       return;
 
     default:
