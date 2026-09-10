@@ -26,6 +26,7 @@ export const MspTransportOperation = Schema.Literals([
   "read-input-stream",
   "write-output-stream",
   "read-process-exit-status",
+  "await-response",
 ]);
 export type MspTransportOperation = typeof MspTransportOperation.Type;
 

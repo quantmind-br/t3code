@@ -23,7 +23,14 @@
  * `readThread`, which serves this adapter's own in-memory item cache
  * (populated from live notifications) rather than a fresh `session/read`
  * query — sufficient for feedback upload and diagnostics, not a substitute
- * for the native session log.
+ * for the native session log. Also known and accepted: if the notification
+ * queue fails on a protocol-level parse/write error (as opposed to the host
+ * process actually exiting), this thread's state is dropped from the map so
+ * new calls fail cleanly, but the underlying scope is not force-closed from
+ * inside the consumer's own fiber — `Scope.close` on a scope from one of its
+ * own children risks a self-deadlock this codebase hasn't verified is safe.
+ * The common case (host process exited) doesn't hit this: the OS process is
+ * already gone.
  *
  * @module provider/Layers/MuseAdapter
  */
@@ -46,6 +53,7 @@ import {
   type ProviderTurnStartResult,
   TurnId,
 } from "@t3tools/contracts";
+import * as Cause from "effect/Cause";
 import * as DateTime from "effect/DateTime";
 import * as Effect from "effect/Effect";
 import * as Exit from "effect/Exit";
@@ -82,18 +90,31 @@ interface MuseResumeCursor {
   readonly viewCursor?: string;
 }
 
-function parseMuseResumeCursor(raw: unknown): MuseResumeCursor | undefined {
-  if (typeof raw !== "object" || raw === null || Array.isArray(raw)) return undefined;
+/**
+ * `undefined` means no cursor was supplied at all (start fresh is correct).
+ * `"invalid"` means one WAS supplied but doesn't parse — callers must fail
+ * loudly rather than silently falling back to `session/start`, which would
+ * quietly abandon the original Muse session and rebind the thread to a new
+ * one underneath an unsuspecting UI.
+ */
+function parseMuseResumeCursor(raw: unknown): MuseResumeCursor | undefined | "invalid" {
+  if (raw === undefined || raw === null) return undefined;
+  if (typeof raw !== "object" || Array.isArray(raw)) return "invalid";
   const record = raw as Record<string, unknown>;
-  if (record.schemaVersion !== RESUME_CURSOR_VERSION) return undefined;
+  if (record.schemaVersion !== RESUME_CURSOR_VERSION) return "invalid";
   if (typeof record.museSessionId !== "string" || record.museSessionId.trim().length === 0) {
-    return undefined;
+    return "invalid";
   }
   return {
     schemaVersion: RESUME_CURSOR_VERSION,
     museSessionId: record.museSessionId,
     ...(typeof record.viewCursor === "string" ? { viewCursor: record.viewCursor } : {}),
   };
+}
+
+interface AnsweredUserInput {
+  readonly pending: MspSchema.UserInputRequestParams;
+  readonly answers: ProviderUserInputAnswers;
 }
 
 interface PendingApproval {
@@ -117,6 +138,12 @@ interface MuseThreadState {
   readonly activeTurnId: Ref.Ref<Option.Option<TurnId>>;
   readonly pendingApprovals: Ref.Ref<Map<string, PendingApproval>>;
   readonly pendingUserInputs: Ref.Ref<Map<string, MspSchema.UserInputRequestParams>>;
+  /** Requests this adapter itself already answered (via `respondToUserInput`),
+   * awaiting the host's own `userInput/settled` notification. Keeping the
+   * real answers here — rather than emitting `user-input.resolved` eagerly
+   * — means settlement is reported exactly once, from one place, whether it
+   * originated locally or from a timeout/interruption/another client. */
+  readonly pendingAnsweredUserInputs: Ref.Ref<Map<string, AnsweredUserInput>>;
   /** Best-effort item cache for `readThread`; not the native session log. */
   readonly items: Ref.Ref<Array<MspSchema.Item>>;
   readonly itemKindByItemId: Ref.Ref<Map<string, string>>;
@@ -198,12 +225,11 @@ const canonicalItemType = (item: MspSchema.Item): string => {
   }
 };
 
-const itemTitle = (item: MspSchema.Item): string | undefined =>
-  typeof item.toolName === "string"
-    ? item.toolName
-    : typeof item.commandText === "string"
-      ? item.commandText
-      : undefined;
+const itemTitle = (item: MspSchema.Item): string | undefined => {
+  if (typeof item.toolName === "string") return item.toolName;
+  if (typeof item.commandText === "string") return item.commandText;
+  return undefined;
+};
 
 const itemDetail = (item: MspSchema.Item): string | undefined =>
   typeof item.fallbackText === "string" ? item.fallbackText : undefined;
@@ -268,24 +294,34 @@ export const makeMuseAdapter = Effect.fn("makeMuseAdapter")(function* (
     state.client.notifications.pipe(
       Stream.runForEach((notification) => handleNotification(state, notification)),
       Effect.catchCause((cause) =>
-        Effect.gen(function* () {
-          const base = yield* emitBase({ threadId: state.threadId });
-          // The host connection is gone: nothing more will ever come from it,
-          // so drop the thread from the live map now rather than leaving
-          // `hasSession`/`listSessions` report a session that can no longer
-          // accept turns or answer approvals.
-          yield* Ref.update(threads, (current) => {
-            const next = new Map(current);
-            next.delete(state.threadId);
-            return next;
-          });
-          yield* emit({
-            ...base,
-            type: "session.exited",
-            payload: { reason: "host connection closed", recoverable: false, exitKind: "error" },
-            raw: { source: "muse.msp.notification", payload: String(cause) },
-          } as ProviderRuntimeEvent);
-        }),
+        // Closing `state.scope` (an intentional `stopSession`/`stopAll`/host
+        // replacement) interrupts this consumer too — that is not a transport
+        // failure and must not be reported as one, or runtime ingestion
+        // treats an ordinary stop as a provider crash and clears turn state.
+        Cause.hasInterruptsOnly(cause)
+          ? Effect.void
+          : Effect.gen(function* () {
+              const base = yield* emitBase({ threadId: state.threadId });
+              // The host connection is gone: nothing more will ever come from it,
+              // so drop the thread from the live map now rather than leaving
+              // `hasSession`/`listSessions` report a session that can no longer
+              // accept turns or answer approvals.
+              yield* Ref.update(threads, (current) => {
+                const next = new Map(current);
+                next.delete(state.threadId);
+                return next;
+              });
+              yield* emit({
+                ...base,
+                type: "session.exited",
+                payload: {
+                  reason: "host connection closed",
+                  recoverable: false,
+                  exitKind: "error",
+                },
+                raw: { source: "muse.msp.notification", payload: String(cause) },
+              } as ProviderRuntimeEvent);
+            }),
       ),
       Effect.forkIn(state.scope),
     );
@@ -355,12 +391,15 @@ export const makeMuseAdapter = Effect.fn("makeMuseAdapter")(function* (
             ...current.filter((existing) => existing.itemId !== item.itemId),
             item,
           ]);
+          const ITEM_LIFECYCLE_EVENT_TYPE = {
+            "item/started": "item.started",
+            "item/updated": "item.updated",
+            "item/completed": "item.completed",
+          } as const;
           const eventType =
-            notification.method === "item/started"
-              ? "item.started"
-              : notification.method === "item/updated"
-                ? "item.updated"
-                : "item.completed";
+            ITEM_LIFECYCLE_EVENT_TYPE[
+              notification.method as keyof typeof ITEM_LIFECYCLE_EVENT_TYPE
+            ];
           const activeTurnId = yield* Ref.get(state.activeTurnId);
           yield* emit({
             ...base,
@@ -384,14 +423,16 @@ export const makeMuseAdapter = Effect.fn("makeMuseAdapter")(function* (
           // Only "agentMessage" text is ever the model's answer; tool/shell
           // output and unmapped item kinds must never masquerade as
           // assistant text downstream.
-          const streamKind =
-            kind === "agentMessage"
-              ? "assistant_text"
-              : kind === "reasoning"
-                ? "reasoning_text"
-                : kind === "toolCall" || kind === "userShell"
-                  ? "command_output"
-                  : "unknown";
+          const CONTENT_DELTA_STREAM_KIND: Record<
+            string,
+            "assistant_text" | "reasoning_text" | "command_output"
+          > = {
+            agentMessage: "assistant_text",
+            reasoning: "reasoning_text",
+            toolCall: "command_output",
+            userShell: "command_output",
+          };
+          const streamKind = (kind && CONTENT_DELTA_STREAM_KIND[kind]) ?? "unknown";
           const activeTurnId = yield* Ref.get(state.activeTurnId);
           yield* emit({
             ...base,
@@ -542,6 +583,30 @@ export const makeMuseAdapter = Effect.fn("makeMuseAdapter")(function* (
           const params = yield* decode(MspSchema.UserInputSettledParams);
           if (Option.isNone(params)) return;
           yield* Ref.set(state.viewCursor, params.value.viewCursor);
+          // The single place `user-input.resolved` is emitted, for both
+          // paths: check the answers this adapter itself submitted first
+          // (respondToUserInput stashes them here instead of emitting
+          // eagerly, precisely to avoid a double resolution), falling back
+          // to an externally-settled request (timeout/interruption/another
+          // client) with no known answers.
+          const answeredLocally = yield* Ref.modify(state.pendingAnsweredUserInputs, (current) => {
+            const existing = current.get(params.value.userInputId);
+            if (!existing) return [Option.none<AnsweredUserInput>(), current] as const;
+            const next = new Map(current);
+            next.delete(params.value.userInputId);
+            return [Option.some(existing), next] as const;
+          });
+          if (Option.isSome(answeredLocally)) {
+            yield* emit({
+              ...base,
+              turnId: TurnId.make(answeredLocally.value.pending.turnId),
+              itemId: RuntimeItemId.make(answeredLocally.value.pending.itemId),
+              requestId: RuntimeRequestId.make(params.value.userInputId),
+              type: "user-input.resolved",
+              payload: { answers: answeredLocally.value.answers },
+            } as ProviderRuntimeEvent);
+            return;
+          }
           const pending = yield* Ref.modify(state.pendingUserInputs, (current) => {
             const existing = current.get(params.value.userInputId);
             if (!existing)
@@ -550,9 +615,6 @@ export const makeMuseAdapter = Effect.fn("makeMuseAdapter")(function* (
             next.delete(params.value.userInputId);
             return [Option.some(existing), next] as const;
           });
-          // A settlement this adapter didn't cause locally (timeout,
-          // interruption, or another client answering) still needs to close
-          // the request in T3, or the question stays visibly pending forever.
           if (Option.isSome(pending)) {
             yield* emit({
               ...base,
@@ -631,7 +693,16 @@ export const makeMuseAdapter = Effect.fn("makeMuseAdapter")(function* (
   ): Effect.Effect<ProviderSession, ProviderAdapterError> =>
     Effect.gen(function* () {
       const cwd = input.cwd;
-      const resumeCursor = parseMuseResumeCursor(input.resumeCursor);
+      const parsedResumeCursor = parseMuseResumeCursor(input.resumeCursor);
+      if (parsedResumeCursor === "invalid") {
+        return yield* new ProviderAdapterValidationError({
+          provider: PROVIDER,
+          operation: "startSession",
+          issue:
+            "Muse resume cursor is malformed; refusing to silently start a new session over it.",
+        });
+      }
+      const resumeCursor = parsedResumeCursor;
 
       const client = yield* resolveSpawnCommand(
         options.binaryPath,
@@ -670,7 +741,11 @@ export const makeMuseAdapter = Effect.fn("makeMuseAdapter")(function* (
             })
             .pipe(
               Effect.mapError(mapMspError(input.threadId, "session/resume")),
-              Effect.map((result) => ({ session: result.session, viewCursor: result.viewCursor })),
+              Effect.map((result) => ({
+                session: result.session,
+                viewCursor: result.viewCursor,
+                historyItems: result.history.items,
+              })),
             )
         : yield* client
             .sessionStart({
@@ -679,7 +754,13 @@ export const makeMuseAdapter = Effect.fn("makeMuseAdapter")(function* (
               ...(cwd ? { workspaceRoot: cwd } : {}),
               ...(input.modelSelection?.model ? { modelId: input.modelSelection.model } : {}),
             })
-            .pipe(Effect.mapError(mapMspError(input.threadId, "session/start")));
+            .pipe(
+              Effect.mapError(mapMspError(input.threadId, "session/start")),
+              Effect.map((result) => ({
+                ...result,
+                historyItems: null as ReadonlyArray<unknown> | null,
+              })),
+            );
 
       if (resumeCursor) {
         // `session/resume` doesn't accept `approvalMode`/`modelId`; apply
@@ -721,28 +802,56 @@ export const makeMuseAdapter = Effect.fn("makeMuseAdapter")(function* (
         ),
         pendingApprovals: yield* Ref.make(new Map<string, PendingApproval>()),
         pendingUserInputs: yield* Ref.make(new Map<string, MspSchema.UserInputRequestParams>()),
+        pendingAnsweredUserInputs: yield* Ref.make(new Map<string, AnsweredUserInput>()),
         items: yield* Ref.make<Array<MspSchema.Item>>([]),
         itemKindByItemId: yield* Ref.make(new Map<string, string>()),
         createdAt: sessionCreatedAt,
         runtimeMode: yield* Ref.make(input.runtimeMode),
         modelId: yield* Ref.make(input.modelSelection?.model),
       };
+      if (startResult.historyItems) {
+        // Seed item-kind/content state from the resumed session's history
+        // before consuming live notifications: without this, deltas for an
+        // already-in-flight agentMessage classify as "unknown" (dropped by
+        // ingestion) until another lifecycle event happens to arrive.
+        const kindEntries: Array<readonly [string, string]> = [];
+        const historyItemRecords: Array<MspSchema.Item> = [];
+        for (const raw of startResult.historyItems) {
+          if (typeof raw !== "object" || raw === null) continue;
+          const record = raw as Record<string, unknown>;
+          if (typeof record.itemId !== "string" || typeof record.kind !== "string") continue;
+          kindEntries.push([record.itemId, record.kind]);
+          historyItemRecords.push(record as MspSchema.Item);
+        }
+        if (kindEntries.length > 0) {
+          yield* Ref.set(state.itemKindByItemId, new Map(kindEntries));
+          yield* Ref.set(state.items, historyItemRecords);
+        }
+      }
       // A reconnect for a thread that already has a live host (e.g. a resume
       // racing an existing session) must not leak the old scope/process.
-      const previous = (yield* Ref.get(threads)).get(input.threadId);
+      // Read-and-set as one atomic `Ref.modify`, not a separate get/update:
+      // two concurrent starts for the same thread must not both observe "no
+      // previous entry" and each overwrite the other's, leaking whichever
+      // host loses the race from `stopAll`'s view entirely.
+      const previous = yield* Ref.modify(threads, (current) => {
+        const existing = current.get(input.threadId);
+        return [existing, new Map(current).set(input.threadId, state)] as const;
+      });
       if (previous) yield* Scope.close(previous.scope, Exit.void).pipe(Effect.ignore);
-      yield* Ref.update(threads, (current) => new Map(current).set(input.threadId, state));
-      yield* attachNotificationConsumer(state);
       yield* Scope.addFinalizer(
         scope,
         Effect.sync(() => undefined),
       );
-
       if (resumeCursor) {
         // Resume drops in-flight approval/user-input requests unless they're
         // explicitly reconciled: without this, a session restored while
-        // waiting on one answers as "unknown request" forever.
-        const pendingRequestsBase = yield* emitBase({ threadId: input.threadId });
+        // waiting on one answers as "unknown request" forever. Reconciling
+        // this snapshot BEFORE `attachNotificationConsumer` starts consuming
+        // live notifications (below) avoids racing a concurrent
+        // approval/updated or approval/resolved against this replace — any
+        // notification that arrives meanwhile just queues (the incoming
+        // queue is unbounded) until the consumer attaches.
         const pending = yield* client
           .approvalListPending({ sessionId: state.museSessionId })
           .pipe(Effect.mapError(mapMspError(input.threadId, "approval/listPending")));
@@ -770,22 +879,28 @@ export const makeMuseAdapter = Effect.fn("makeMuseAdapter")(function* (
         yield* Effect.forEach(
           pending.approvals,
           (p) =>
-            emit({
-              ...pendingRequestsBase,
-              turnId: TurnId.make(p.turnId),
-              itemId: RuntimeItemId.make(p.itemId),
-              requestId: RuntimeRequestId.make(p.approvalId),
-              type: "request.opened",
-              payload: {
-                requestType: "unknown",
-                detail: p.rawArgs.trim().length > 0 ? p.rawArgs : p.toolName,
-                args: { toolName: p.toolName, rawArgs: p.rawArgs, subject: p.subject },
-                options: p.availableChoices.map((choice) => ({
-                  decision: mapMspDecisionToProvider(choice.decision),
-                  label: choice.label,
-                })),
-              },
-            } as ProviderRuntimeEvent),
+            Effect.gen(function* () {
+              // A fresh eventId/createdAt per emission: reusing one across
+              // multiple restored requests would collide on the same
+              // activity ID downstream and each overwrite the last.
+              const restoredBase = yield* emitBase({ threadId: input.threadId });
+              yield* emit({
+                ...restoredBase,
+                turnId: TurnId.make(p.turnId),
+                itemId: RuntimeItemId.make(p.itemId),
+                requestId: RuntimeRequestId.make(p.approvalId),
+                type: "request.opened",
+                payload: {
+                  requestType: "unknown",
+                  detail: p.rawArgs.trim().length > 0 ? p.rawArgs : p.toolName,
+                  args: { toolName: p.toolName, rawArgs: p.rawArgs, subject: p.subject },
+                  options: p.availableChoices.map((choice) => ({
+                    decision: mapMspDecisionToProvider(choice.decision),
+                    label: choice.label,
+                  })),
+                },
+              } as ProviderRuntimeEvent);
+            }),
           { discard: true },
         );
         const decodedUserInputs = yield* Effect.forEach(pending.userInputs, (raw) =>
@@ -799,29 +914,33 @@ export const makeMuseAdapter = Effect.fn("makeMuseAdapter")(function* (
         yield* Effect.forEach(
           userInputs,
           (p) =>
-            emit({
-              ...pendingRequestsBase,
-              turnId: TurnId.make(p.turnId),
-              itemId: RuntimeItemId.make(p.itemId),
-              requestId: RuntimeRequestId.make(p.userInputId),
-              type: "user-input.requested",
-              payload: {
-                questions: p.questions.map((question) => ({
-                  id: question.id,
-                  header: question.header,
-                  question: question.question,
-                  options: question.options.map((option) => ({
-                    label: option.label,
-                    description: option.description ?? "",
+            Effect.gen(function* () {
+              const restoredBase = yield* emitBase({ threadId: input.threadId });
+              yield* emit({
+                ...restoredBase,
+                turnId: TurnId.make(p.turnId),
+                itemId: RuntimeItemId.make(p.itemId),
+                requestId: RuntimeRequestId.make(p.userInputId),
+                type: "user-input.requested",
+                payload: {
+                  questions: p.questions.map((question) => ({
+                    id: question.id,
+                    header: question.header,
+                    question: question.question,
+                    options: question.options.map((option) => ({
+                      label: option.label,
+                      description: option.description ?? "",
+                    })),
+                    allowCustomAnswer: true,
+                    multiSelect: question.selection.mode === "multiple",
                   })),
-                  allowCustomAnswer: true,
-                  multiSelect: question.selection.mode === "multiple",
-                })),
-              },
-            } as ProviderRuntimeEvent),
+                },
+              } as ProviderRuntimeEvent);
+            }),
           { discard: true },
         );
       }
+      yield* attachNotificationConsumer(state);
 
       const base = yield* emitBase({ threadId: input.threadId });
       yield* emit({
@@ -835,7 +954,10 @@ export const makeMuseAdapter = Effect.fn("makeMuseAdapter")(function* (
       return {
         provider: PROVIDER,
         providerInstanceId: options.instanceId,
-        status: "ready",
+        status: startResult.session.activeTurnId ? "running" : "ready",
+        ...(startResult.session.activeTurnId
+          ? { activeTurnId: TurnId.make(startResult.session.activeTurnId) }
+          : {}),
         runtimeMode: input.runtimeMode,
         ...(cwd ? { cwd } : {}),
         ...(input.modelSelection?.model ? { model: input.modelSelection.model } : {}),
@@ -988,13 +1110,19 @@ export const makeMuseAdapter = Effect.fn("makeMuseAdapter")(function* (
         })
         .pipe(Effect.mapError(mapMspError(threadId, "userInput/answer")), Effect.asVoid);
 
-      const base = yield* emitBase({ threadId });
-      yield* emit({
-        ...base,
-        requestId: RuntimeRequestId.make(requestId),
-        type: "user-input.resolved",
-        payload: { answers },
-      } as ProviderRuntimeEvent);
+      // Don't emit `user-input.resolved` here: the host's own
+      // `userInput/settled` notification is the single source of truth for
+      // when this request is actually done, and emitting eagerly here too
+      // would double-resolve it (ingestion would persist two separate
+      // "submitted" activities for one request, in either arrival order).
+      yield* Ref.update(state.pendingUserInputs, (current) => {
+        const next = new Map(current);
+        next.delete(requestId);
+        return next;
+      });
+      yield* Ref.update(state.pendingAnsweredUserInputs, (current) =>
+        new Map(current).set(requestId, { pending, answers }),
+      );
     });
 
   const stopSession = (threadId: ThreadId): Effect.Effect<void, ProviderAdapterError> =>
@@ -1004,13 +1132,20 @@ export const makeMuseAdapter = Effect.fn("makeMuseAdapter")(function* (
     Ref.get(threads).pipe(
       Effect.flatMap((current) =>
         Effect.forEach(Array.from(current.values()), (state) =>
-          Ref.get(state.runtimeMode).pipe(
-            Effect.map((runtimeMode): ProviderSession => ({
+          Effect.all({
+            runtimeMode: Ref.get(state.runtimeMode),
+            activeTurnId: Ref.get(state.activeTurnId),
+          }).pipe(
+            Effect.map(({ runtimeMode, activeTurnId }): ProviderSession => ({
               provider: PROVIDER,
               providerInstanceId: options.instanceId,
-              status: "ready",
+              // `runStopAll`'s continue-after-update path only resumes
+              // sessions reported "running" with an activeTurnId set —
+              // report both truthfully, not an unconditional idle/ready.
+              status: Option.isSome(activeTurnId) ? "running" : "ready",
               runtimeMode,
               ...(state.cwd ? { cwd: state.cwd } : {}),
+              ...(Option.isSome(activeTurnId) ? { activeTurnId: activeTurnId.value } : {}),
               threadId: state.threadId,
               resumeCursor: {
                 schemaVersion: RESUME_CURSOR_VERSION,
@@ -1084,12 +1219,15 @@ export const makeMuseAdapter = Effect.fn("makeMuseAdapter")(function* (
           // skipped compaction (`result.reason` set) is surfaced instead of
           // silently discarded.
           if (result.reason) {
-            yield* emit({
-              ...base,
-              type: "runtime.warning",
-              payload: { message: `Muse did not compact this session: ${result.reason}` },
-            } as ProviderRuntimeEvent);
-            return;
+            // ProviderService waits for the canonical compaction-completed
+            // event after `start` succeeds; a bare warning never settles
+            // that wait, leaving a skipped/rejected compaction pending for
+            // the full timeout. Fail instead so the request clears now.
+            return yield* new ProviderAdapterRequestError({
+              provider: PROVIDER,
+              method: "session/compact",
+              detail: `Muse did not compact this session: ${result.reason}`,
+            });
           }
           yield* emit({
             ...base,

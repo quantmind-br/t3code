@@ -30,6 +30,7 @@ import { JsonRpcResponseEnvelope } from "./_internal/shared.ts";
 
 const isJsonRpcResponseEnvelope = Schema.is(JsonRpcResponseEnvelope);
 const isMspError = Schema.is(MspError.MspError);
+const DEFAULT_REQUEST_TIMEOUT_MS = 60_000;
 export interface MspProtocolLogEvent {
   readonly direction: "incoming" | "outgoing";
   readonly stage: "raw" | "decoded" | "decode_failed";
@@ -48,6 +49,12 @@ export interface MspPatchedProtocolOptions {
   readonly logOutgoing?: boolean;
   readonly logger?: (event: MspProtocolLogEvent) => Effect.Effect<void, never>;
   readonly onTermination?: (error: MspError.MspError) => Effect.Effect<void, never>;
+  /** Default deadline applied to every `request()` call. MSP requests await
+   * an unbounded `Deferred` with no protocol-level deadline, so a live but
+   * nonresponsive host would otherwise hang initialize/session/turn/approval
+   * calls indefinitely. Defaults to 60s; override per connection if a
+   * caller needs a different bound. */
+  readonly requestTimeoutMs?: number;
 }
 
 export interface MspPatchedProtocol {
@@ -261,9 +268,15 @@ export const makeMspPatchedProtocol = Effect.fn("makeMspPatchedProtocol")(functi
         return lines;
       }).pipe(Effect.flatMap((lines) => Effect.forEach(lines, handleLine, { discard: true }))),
     ),
-    Effect.matchEffect({
-      onFailure: (error) =>
-        handleTermination(() => Effect.succeed(normalizeError(error, "read-input-stream"))),
+    // `matchCauseEffect`, not `matchEffect`: a defect (an incoming logger
+    // or the chunk-splitting sync block throwing, not just a typed E
+    // failure) must still run the termination path, or pending RPCs and the
+    // notification consumer stay blocked forever with this reader dead.
+    Effect.matchCauseEffect({
+      onFailure: (cause) =>
+        handleTermination(() =>
+          Effect.succeed(normalizeError(Cause.squash(cause), "read-input-stream")),
+        ),
       onSuccess: () =>
         Effect.sync(() => {
           const line = remainder.join("");
@@ -271,8 +284,11 @@ export const makeMspPatchedProtocol = Effect.fn("makeMspPatchedProtocol")(functi
           return line;
         }).pipe(
           Effect.flatMap(handleLine),
-          Effect.matchEffect({
-            onFailure: (error) => handleTermination(() => Effect.succeed(error)),
+          Effect.matchCauseEffect({
+            onFailure: (cause) =>
+              handleTermination(() =>
+                Effect.succeed(normalizeError(Cause.squash(cause), "read-input-stream")),
+              ),
             onSuccess: () =>
               handleTermination(
                 () =>
@@ -295,6 +311,8 @@ export const makeMspPatchedProtocol = Effect.fn("makeMspPatchedProtocol")(functi
     Effect.forkScoped,
   );
 
+  const requestTimeoutMs = options.requestTimeoutMs ?? DEFAULT_REQUEST_TIMEOUT_MS;
+
   const request = (method: string, payload?: unknown) =>
     Effect.gen(function* () {
       const requestId = yield* Ref.modify(
@@ -302,17 +320,35 @@ export const makeMspPatchedProtocol = Effect.fn("makeMspPatchedProtocol")(functi
         (current) => [current, current + 1] as const,
       );
       const deferred = yield* Deferred.make<unknown, MspError.MspError>();
-      yield* Ref.update(pending, (current) =>
-        new Map(current).set(String(requestId), { deferred, method }),
-      );
-      yield* offerOutgoing({
-        jsonrpc: "2.0",
-        id: requestId,
-        method,
-        ...(payload !== undefined ? { params: payload } : {}),
-      }).pipe(Effect.tapError(() => removePending(String(requestId))));
-      return yield* Deferred.await(deferred).pipe(
-        Effect.onInterrupt(() => removePending(String(requestId))),
+      // A bracket, not two separate cleanup hooks: an interrupt during
+      // `offerOutgoing` itself (not just during the later await) must still
+      // remove this pending entry, or it's retained for the lifetime of a
+      // persistent connection with nothing left that can ever resolve it.
+      return yield* Effect.acquireUseRelease(
+        Ref.update(pending, (current) =>
+          new Map(current).set(String(requestId), { deferred, method }),
+        ),
+        () =>
+          offerOutgoing({
+            jsonrpc: "2.0",
+            id: requestId,
+            method,
+            ...(payload !== undefined ? { params: payload } : {}),
+          }).pipe(Effect.andThen(Deferred.await(deferred))),
+        () => removePending(String(requestId)),
+      ).pipe(
+        Effect.timeoutOrElse({
+          duration: `${requestTimeoutMs} millis`,
+          orElse: () =>
+            Effect.fail(
+              new MspError.MspTransportError({
+                operation: "await-response",
+                cause: new Error(
+                  `Muse MSP request '${method}' timed out after ${requestTimeoutMs}ms.`,
+                ),
+              }),
+            ),
+        }),
       );
     });
 

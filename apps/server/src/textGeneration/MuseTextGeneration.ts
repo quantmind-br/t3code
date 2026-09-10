@@ -64,7 +64,12 @@ export const makeMuseTextGeneration = Effect.fn("makeMuseTextGeneration")(functi
   }): Effect.Effect<S["Type"], TextGenerationError, S["DecodingServices"]> =>
     Effect.gen(function* () {
       const command = museSettings.binaryPath || "muse";
-      const spawnCommand = yield* resolveSpawnCommand(command, ["serve", "--trust-workspace"], {
+      // Deliberately no `--trust-workspace`: this session only ever answers
+      // from the prompt text built above (commit/PR/branch/title), never
+      // reads the actual repository, so an untrusted workspace plus
+      // `approvalMode: "denyUnmatched"` below is the tightest combination
+      // MSP v1 exposes for a one-shot, tool-free generation session.
+      const spawnCommand = yield* resolveSpawnCommand(command, ["serve"], {
         env: environment,
         extendEnv: true,
       }).pipe(
@@ -108,9 +113,14 @@ export const makeMuseTextGeneration = Effect.fn("makeMuseTextGeneration")(functi
           // One-shot metadata generation (commit message/PR body/branch/title)
           // must never execute workspace tools: there's no approval handler
           // attached to this session, and diff/message content is untrusted
-          // input an embedded instruction could target. `denyUnmatched`
-          // auto-denies anything requiring approval instead of hanging or
-          // silently running it under a permissive local Muse config.
+          // input an embedded instruction could target. Combined with no
+          // `--trust-workspace` above, `denyUnmatched` auto-denies anything
+          // requiring approval instead of hanging or silently running under a
+          // permissive local Muse config — note this is best-effort, not a
+          // verified tool-disable boundary: MSP v1 exposes no dedicated
+          // no-tools/isolated mode, so an operation matching an existing
+          // allow policy could still run. If MSP later exposes such a mode,
+          // this session should use it instead.
           approvalMode: "denyUnmatched",
           ...(modelSelection.model ? { modelId: modelSelection.model } : {}),
         })
