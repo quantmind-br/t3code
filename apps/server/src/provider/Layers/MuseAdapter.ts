@@ -475,10 +475,7 @@ export const makeMuseAdapter = Effect.fn("makeMuseAdapter")(function* (
               // tool name, so approval is an informed decision.
               detail: p.rawArgs.trim().length > 0 ? p.rawArgs : p.toolName,
               args: { toolName: p.toolName, rawArgs: p.rawArgs, subject: p.subject },
-              options: p.availableChoices.map((choice) => ({
-                decision: mapMspDecisionToProvider(choice.decision),
-                label: choice.label,
-              })),
+              options: buildApprovalOptions(p.availableChoices),
             },
           } as ProviderRuntimeEvent);
           return;
@@ -521,10 +518,7 @@ export const makeMuseAdapter = Effect.fn("makeMuseAdapter")(function* (
                   rawArgs: updated.value.rawArgs,
                   subject: updated.value.subject,
                 },
-                options: updated.value.availableChoices.map((choice) => ({
-                  decision: mapMspDecisionToProvider(choice.decision),
-                  label: choice.label,
-                })),
+                options: buildApprovalOptions(updated.value.availableChoices),
               },
             } as ProviderRuntimeEvent);
           }
@@ -663,6 +657,28 @@ export const makeMuseAdapter = Effect.fn("makeMuseAdapter")(function* (
     }
   };
 
+  /**
+   * MSP can offer multiple native choices that map to the same canonical
+   * `ProviderApprovalDecision` (e.g. `denied` and `deniedPolicyAmendment` both
+   * mean "decline"). The client only round-trips the canonical decision, not
+   * the native `choiceId`, so offering two buttons for the same decision
+   * makes `resolveMuseChoice` guess which one was actually meant. Keep only
+   * the first native choice per canonical decision — the same first-match
+   * order `resolveMuseChoice` itself resolves with — so whichever button is
+   * shown is provably the one that gets submitted.
+   */
+  const buildApprovalOptions = (availableChoices: ReadonlyArray<MspSchema.ApprovalChoice>) => {
+    const seen = new Set<ProviderApprovalDecision>();
+    const options: Array<{ decision: ProviderApprovalDecision; label: string }> = [];
+    for (const choice of availableChoices) {
+      const decision = mapMspDecisionToProvider(choice.decision);
+      if (seen.has(decision)) continue;
+      seen.add(decision);
+      options.push({ decision, label: choice.label });
+    }
+    return options;
+  };
+
   const closeThread = (threadId: ThreadId) =>
     Ref.modify(threads, (current) => {
       const state = current.get(threadId);
@@ -738,6 +754,11 @@ export const makeMuseAdapter = Effect.fn("makeMuseAdapter")(function* (
               commandId,
               sessionId: resumeCursor.museSessionId,
               cursor: resumeCursor.viewCursor ?? null,
+              // Explicit, not "auto": snapshot/anchored-snapshot history
+              // responses return `items: null`, which would silently skip
+              // the item-kind/content seeding below and leave an in-flight
+              // agentMessage's subsequent deltas unclassified.
+              history: "inline",
             })
             .pipe(
               Effect.mapError(mapMspError(input.threadId, "session/resume")),
@@ -828,21 +849,6 @@ export const makeMuseAdapter = Effect.fn("makeMuseAdapter")(function* (
           yield* Ref.set(state.items, historyItemRecords);
         }
       }
-      // A reconnect for a thread that already has a live host (e.g. a resume
-      // racing an existing session) must not leak the old scope/process.
-      // Read-and-set as one atomic `Ref.modify`, not a separate get/update:
-      // two concurrent starts for the same thread must not both observe "no
-      // previous entry" and each overwrite the other's, leaking whichever
-      // host loses the race from `stopAll`'s view entirely.
-      const previous = yield* Ref.modify(threads, (current) => {
-        const existing = current.get(input.threadId);
-        return [existing, new Map(current).set(input.threadId, state)] as const;
-      });
-      if (previous) yield* Scope.close(previous.scope, Exit.void).pipe(Effect.ignore);
-      yield* Scope.addFinalizer(
-        scope,
-        Effect.sync(() => undefined),
-      );
       if (resumeCursor) {
         // Resume drops in-flight approval/user-input requests unless they're
         // explicitly reconciled: without this, a session restored while
@@ -894,10 +900,7 @@ export const makeMuseAdapter = Effect.fn("makeMuseAdapter")(function* (
                   requestType: "unknown",
                   detail: p.rawArgs.trim().length > 0 ? p.rawArgs : p.toolName,
                   args: { toolName: p.toolName, rawArgs: p.rawArgs, subject: p.subject },
-                  options: p.availableChoices.map((choice) => ({
-                    decision: mapMspDecisionToProvider(choice.decision),
-                    label: choice.label,
-                  })),
+                  options: buildApprovalOptions(p.availableChoices),
                 },
               } as ProviderRuntimeEvent);
             }),
@@ -940,6 +943,26 @@ export const makeMuseAdapter = Effect.fn("makeMuseAdapter")(function* (
           { discard: true },
         );
       }
+      // Publish only now, after spawn/initialize/session-start-or-resume AND
+      // (for resume) pending-request reconciliation have all succeeded —
+      // publishing earlier and failing partway through would leave a dead
+      // entry in `threads` with no consumer ever attached to remove it,
+      // routing this thread at a closed client until the process restarts.
+      // A reconnect for a thread that already has a live host (e.g. a resume
+      // racing an existing session) must not leak the old scope/process.
+      // Read-and-set as one atomic `Ref.modify`, not a separate get/update:
+      // two concurrent starts for the same thread must not both observe "no
+      // previous entry" and each overwrite the other's, leaking whichever
+      // host loses the race from `stopAll`'s view entirely.
+      const previous = yield* Ref.modify(threads, (current) => {
+        const existing = current.get(input.threadId);
+        return [existing, new Map(current).set(input.threadId, state)] as const;
+      });
+      if (previous) yield* Scope.close(previous.scope, Exit.void).pipe(Effect.ignore);
+      yield* Scope.addFinalizer(
+        scope,
+        Effect.sync(() => undefined),
+      );
       yield* attachNotificationConsumer(state);
 
       const base = yield* emitBase({ threadId: input.threadId });
@@ -1077,7 +1100,19 @@ export const makeMuseAdapter = Effect.fn("makeMuseAdapter")(function* (
   ): Effect.Effect<void, ProviderAdapterError> =>
     Effect.gen(function* () {
       const state = yield* requireThread(threadId);
-      const pending = (yield* Ref.get(state.pendingUserInputs)).get(requestId);
+      // Move the request from pendingUserInputs to pendingAnsweredUserInputs
+      // atomically and BEFORE calling userInputAnswer: the protocol dispatches
+      // notifications independently of RPC responses, so `userInput/settled`
+      // can arrive before this RPC's own response. Recording the answer only
+      // after the RPC returns left a window where settlement found neither
+      // map and emitted nothing, or found only the empty-answers fallback.
+      const pending = yield* Ref.modify(state.pendingUserInputs, (current) => {
+        const existing = current.get(requestId);
+        if (!existing) return [undefined, current] as const;
+        const next = new Map(current);
+        next.delete(requestId);
+        return [existing, next] as const;
+      });
       if (!pending) {
         return yield* new ProviderAdapterValidationError({
           provider: PROVIDER,
@@ -1085,6 +1120,9 @@ export const makeMuseAdapter = Effect.fn("makeMuseAdapter")(function* (
           issue: `Unknown or already-settled Muse user-input prompt: ${requestId}`,
         });
       }
+      yield* Ref.update(state.pendingAnsweredUserInputs, (current) =>
+        new Map(current).set(requestId, { pending, answers }),
+      );
       const commandId = yield* randomUuidV7;
       const mspAnswers: Array<MspSchema.UserInputAnswer> = pending.questions.map((question) => {
         const raw = answers[question.id];
@@ -1101,6 +1139,11 @@ export const makeMuseAdapter = Effect.fn("makeMuseAdapter")(function* (
         }
         return { questionId: question.id, freeText: raw === undefined ? "" : JSON.stringify(raw) };
       });
+      // Don't emit `user-input.resolved` here: the host's own
+      // `userInput/settled` notification is the single source of truth for
+      // when this request is actually done, and emitting eagerly here too
+      // would double-resolve it (ingestion would persist two separate
+      // "submitted" activities for one request, in either arrival order).
       yield* state.client
         .userInputAnswer({
           answers: mspAnswers,
@@ -1108,21 +1151,26 @@ export const makeMuseAdapter = Effect.fn("makeMuseAdapter")(function* (
           sessionId: pending.sessionId,
           userInputId: requestId,
         })
-        .pipe(Effect.mapError(mapMspError(threadId, "userInput/answer")), Effect.asVoid);
-
-      // Don't emit `user-input.resolved` here: the host's own
-      // `userInput/settled` notification is the single source of truth for
-      // when this request is actually done, and emitting eagerly here too
-      // would double-resolve it (ingestion would persist two separate
-      // "submitted" activities for one request, in either arrival order).
-      yield* Ref.update(state.pendingUserInputs, (current) => {
-        const next = new Map(current);
-        next.delete(requestId);
-        return next;
-      });
-      yield* Ref.update(state.pendingAnsweredUserInputs, (current) =>
-        new Map(current).set(requestId, { pending, answers }),
-      );
+        .pipe(
+          Effect.mapError(mapMspError(threadId, "userInput/answer")),
+          Effect.asVoid,
+          Effect.tapError(() =>
+            // Nothing was actually sent to Muse: undo the optimistic
+            // answered-state move so the request goes back to pending
+            // instead of being stuck "answered" but never settled.
+            Ref.update(state.pendingAnsweredUserInputs, (current) => {
+              const next = new Map(current);
+              next.delete(requestId);
+              return next;
+            }).pipe(
+              Effect.andThen(
+                Ref.update(state.pendingUserInputs, (current) =>
+                  new Map(current).set(requestId, pending),
+                ),
+              ),
+            ),
+          ),
+        );
     });
 
   const stopSession = (threadId: ThreadId): Effect.Effect<void, ProviderAdapterError> =>

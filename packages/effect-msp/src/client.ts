@@ -32,6 +32,8 @@ export interface MspClientOptions {
   readonly logIncoming?: boolean;
   readonly logOutgoing?: boolean;
   readonly logger?: (event: MspProtocol.MspProtocolLogEvent) => Effect.Effect<void, never>;
+  /** Forwarded to `makeMspPatchedProtocol`; see its doc for the default. */
+  readonly requestTimeoutMs?: number;
 }
 
 const decodeResult = <A, I>(
@@ -115,6 +117,7 @@ export const makeOverStdio = Effect.fn("effect-msp/makeOverStdio")(function* (
     readonly logIncoming?: boolean;
     readonly logOutgoing?: boolean;
     readonly logger?: (event: MspProtocol.MspProtocolLogEvent) => Effect.Effect<void, never>;
+    readonly requestTimeoutMs?: number;
   } = {},
 ): Effect.fn.Return<MspClient, never, Scope.Scope> {
   const protocol = yield* MspProtocol.makeMspPatchedProtocol({
@@ -123,6 +126,9 @@ export const makeOverStdio = Effect.fn("effect-msp/makeOverStdio")(function* (
     ...(options.logIncoming !== undefined ? { logIncoming: options.logIncoming } : {}),
     ...(options.logOutgoing !== undefined ? { logOutgoing: options.logOutgoing } : {}),
     ...(options.logger ? { logger: options.logger } : {}),
+    ...(options.requestTimeoutMs !== undefined
+      ? { requestTimeoutMs: options.requestTimeoutMs }
+      : {}),
   });
 
   const call = <A, I>(method: string, schema: Schema.Codec<A, I>, payload: unknown) =>
@@ -185,5 +191,8 @@ export const spawn = Effect.fn("effect-msp/spawn")(function* (
     ...(options.logIncoming !== undefined ? { logIncoming: options.logIncoming } : {}),
     ...(options.logOutgoing !== undefined ? { logOutgoing: options.logOutgoing } : {}),
     ...(options.logger ? { logger: options.logger } : {}),
+    ...(options.requestTimeoutMs !== undefined
+      ? { requestTimeoutMs: options.requestTimeoutMs }
+      : {}),
   });
 });

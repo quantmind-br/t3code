@@ -313,6 +313,14 @@ export const makeMspPatchedProtocol = Effect.fn("makeMspPatchedProtocol")(functi
 
   const requestTimeoutMs = options.requestTimeoutMs ?? DEFAULT_REQUEST_TIMEOUT_MS;
 
+  // Known limitation: `outgoing` is a plain queue with no cancellation
+  // tracking. A request that times out or is interrupted after its encoded
+  // line has already been enqueued (e.g. the writer is blocked on a stalled
+  // stdout pipe) is still written once the writer unblocks — the pending-map
+  // entry is removed so no caller ever sees the (late) response, but the
+  // host still receives it. Fully closing this would need per-entry
+  // cancellation state threaded through the outgoing queue; deferred as a
+  // larger change, not attempted as part of adding the deadline above.
   const request = (method: string, payload?: unknown) =>
     Effect.gen(function* () {
       const requestId = yield* Ref.modify(
