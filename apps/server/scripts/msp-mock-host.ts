@@ -34,6 +34,8 @@ interface MockScript {
       nextCursor: string | null;
     }
   >;
+  /** `model/list` rows; defaults to a two-entry catalog shaped like the real host's. */
+  readonly models?: ReadonlyArray<Record<string, unknown>>;
 }
 
 const script: MockScript = scriptPath
@@ -113,6 +115,44 @@ const handle = (request: JsonRpcRequest) => {
       });
       // Deliberately NOT setting `initialized` here: only the client's own
       // `initialized` notification opens the gate, same as the real host.
+      return;
+
+    case "model/list":
+      // A pure query (tdd §3.10): answered without a session, mirrors the real
+      // host, which serves the catalog with no credentials and an empty cwd.
+      respond(id, {
+        models: script.models ?? [
+          {
+            contextLimit: 1007997,
+            cost: null,
+            description: null,
+            displayLabel: "muse-spark-1.3",
+            isActive: false,
+            isDefault: false,
+            modelId: "muse-spark-1.3",
+            outputLimit: 128000,
+            profileId: "tbh",
+            providerId: "meta",
+            releaseDate: "2026-09-02",
+          },
+          {
+            contextLimit: 1007997,
+            cost: null,
+            description: null,
+            displayLabel: "muse-spark-1.3-contributor",
+            isActive: false,
+            isDefault: true,
+            modelId: "muse-spark-1.3-contributor",
+            outputLimit: 128000,
+            profileId: "tbh",
+            providerId: "meta",
+            releaseDate: "2026-09-02",
+          },
+        ],
+        profileId: "tbh",
+        providerId: "meta",
+        source: "providerCatalog",
+      });
       return;
 
     case "session/start":

@@ -109,6 +109,7 @@ export const MuseDriver: ProviderDriver<MuseSettings, MuseDriverEnv> = {
       const checkProvider = checkMuseProviderStatus(effectiveConfig, processEnv).pipe(
         Effect.map(stampIdentity),
         Effect.provideService(ChildProcessSpawner.ChildProcessSpawner, spawner),
+        Effect.provideService(FileSystem.FileSystem, fileSystem),
       );
 
       const snapshotSettings = makeProviderSnapshotSettingsSource(effectiveConfig, serverSettings);
