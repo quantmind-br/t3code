@@ -24,6 +24,7 @@ export type MspProtocolParseOperation = typeof MspProtocolParseOperation.Type;
 
 export const MspTransportOperation = Schema.Literals([
   "read-input-stream",
+  "write-output-stream",
   "read-process-exit-status",
 ]);
 export type MspTransportOperation = typeof MspTransportOperation.Type;
@@ -163,9 +164,12 @@ export class MspRequestError extends Schema.TaggedError<MspRequestError>()("MspR
   }
 
   static fromProtocolError(error: MspProtocolErrorShape, method: string, requestId: string) {
-    const data = error.data as { readonly kind?: unknown } | undefined;
+    const data = error.data as { readonly kind?: unknown } | null | undefined;
     const kind =
-      data !== undefined && typeof data.kind === "string" && Schema.is(MspErrorKind)(data.kind)
+      data !== undefined &&
+      data !== null &&
+      typeof data.kind === "string" &&
+      Schema.is(MspErrorKind)(data.kind)
         ? data.kind
         : undefined;
     return new MspRequestError({

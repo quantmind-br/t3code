@@ -10,7 +10,7 @@
 import { type ModelSelection, type MuseSettings, TextGenerationError } from "@t3tools/contracts";
 import * as Effect from "effect/Effect";
 import * as Fiber from "effect/Fiber";
-import * as Option from "effect/Option";
+import * as Deferred from "effect/Deferred";
 import * as Ref from "effect/Ref";
 import * as Stream from "effect/Stream";
 import * as Schema from "effect/Schema";
@@ -37,6 +37,11 @@ import { sanitizeBranchFragment, sanitizeFeatureBranchName } from "@t3tools/shar
 
 const MUSE_TIMEOUT_MS = 180_000;
 const isTextGenerationError = Schema.is(TextGenerationError);
+type MuseTextGenerationOperation =
+  | "generateCommitMessage"
+  | "generatePrContent"
+  | "generateBranchName"
+  | "generateThreadTitle";
 
 export const makeMuseTextGeneration = Effect.fn("makeMuseTextGeneration")(function* (
   museSettings: MuseSettings,
@@ -51,11 +56,7 @@ export const makeMuseTextGeneration = Effect.fn("makeMuseTextGeneration")(functi
     outputSchemaJson,
     modelSelection,
   }: {
-    operation:
-      | "generateCommitMessage"
-      | "generatePrContent"
-      | "generateBranchName"
-      | "generateThreadTitle";
+    operation: MuseTextGenerationOperation;
     cwd: string;
     prompt: string;
     outputSchemaJson: S;
@@ -82,6 +83,7 @@ export const makeMuseTextGeneration = Effect.fn("makeMuseTextGeneration")(functi
         args: spawnCommand.args,
         env: environment,
         cwd,
+        shell: spawnCommand.shell,
       }).pipe(
         Effect.provideService(ChildProcessSpawner.ChildProcessSpawner, spawner),
         Effect.mapError(
@@ -103,6 +105,13 @@ export const makeMuseTextGeneration = Effect.fn("makeMuseTextGeneration")(functi
         .sessionStart({
           commandId,
           workspaceRoot: cwd,
+          // One-shot metadata generation (commit message/PR body/branch/title)
+          // must never execute workspace tools: there's no approval handler
+          // attached to this session, and diff/message content is untrusted
+          // input an embedded instruction could target. `denyUnmatched`
+          // auto-denies anything requiring approval instead of hanging or
+          // silently running it under a permissive local Muse config.
+          approvalMode: "denyUnmatched",
           ...(modelSelection.model ? { modelId: modelSelection.model } : {}),
         })
         .pipe(
@@ -113,7 +122,7 @@ export const makeMuseTextGeneration = Effect.fn("makeMuseTextGeneration")(functi
         );
 
       const textFiber = yield* Effect.forkChild(
-        collectAgentText(client, started.session.sessionId),
+        collectAgentText(client, started.session.sessionId, operation),
       );
 
       const turnCommandId = yield* randomUuidV7;
@@ -130,18 +139,7 @@ export const makeMuseTextGeneration = Effect.fn("makeMuseTextGeneration")(functi
           ),
         );
 
-      const trimmed = (yield* Fiber.join(textFiber).pipe(
-        Effect.timeoutOption(MUSE_TIMEOUT_MS),
-        Effect.flatMap(
-          Option.match({
-            onNone: () =>
-              Effect.fail(
-                new TextGenerationError({ operation, detail: "Muse request timed out." }),
-              ),
-            onSome: Effect.succeed,
-          }),
-        ),
-      )).trim();
+      const trimmed = (yield* Fiber.join(textFiber)).trim();
 
       if (!trimmed) {
         return yield* new TextGenerationError({ operation, detail: "Muse returned empty output." });
@@ -161,6 +159,17 @@ export const makeMuseTextGeneration = Effect.fn("makeMuseTextGeneration")(functi
         }),
       );
     }).pipe(
+      // Bounds the whole spawn/initialize/session/turn/collect sequence, not
+      // just the final fiber join — MSP requests await an unbounded Deferred
+      // with no built-in deadline, so a live-but-nonresponsive host could
+      // otherwise hang indefinitely before ever reaching a per-step timeout.
+      // Wrapping the scoped Effect also closes the spawned child process on
+      // timeout, since the timeout interrupts the source effect.
+      Effect.timeoutOrElse({
+        duration: `${MUSE_TIMEOUT_MS} millis`,
+        orElse: () =>
+          Effect.fail(new TextGenerationError({ operation, detail: "Muse request timed out." })),
+      }),
       Effect.mapError((cause) =>
         isTextGenerationError(cause)
           ? cause
@@ -260,46 +269,108 @@ export const makeMuseTextGeneration = Effect.fn("makeMuseTextGeneration")(functi
 
 /**
  * Folds `item/delta` (and, for items that never stream deltas, the final
- * `item/completed`) for `agentMessage` items into one string, resolving as
- * soon as `turn/completed` arrives on this session. Single-turn,
- * single-session use only — not a general-purpose transcript reader.
+ * `item/completed`) into one string, resolving as soon as `turn/completed`
+ * arrives on this session. Only text belonging to `agentMessage` items is
+ * ever included — reasoning and tool/shell output must never leak into the
+ * JSON payload this text is later decoded as — and a `turn/completed` whose
+ * `terminal` isn't `"completed"` fails instead of returning whatever
+ * partial JSON happened to arrive before the turn failed or was cancelled.
+ * Single-turn, single-session use only — not a general-purpose transcript
+ * reader.
  */
-function collectAgentText(client: MspClient.MspClient, sessionId: string): Effect.Effect<string> {
-  return Ref.make("").pipe(
-    Effect.flatMap((textRef) =>
-      client.notifications.pipe(
-        Stream.mapEffect((notification) =>
-          Effect.gen(function* () {
-            const params = notification.params as
-              | (Record<string, unknown> & { sessionId?: unknown })
-              | undefined;
-            if (!params || params.sessionId !== sessionId) return false;
-            if (notification.method === "item/delta") {
-              const delta = params as { delta?: unknown; field?: unknown };
-              if (
-                typeof delta.delta === "string" &&
-                (delta.field === undefined || delta.field === "text")
-              ) {
-                yield* Ref.update(textRef, (current) => current + delta.delta);
-              }
-              return false;
+function collectAgentText(
+  client: MspClient.MspClient,
+  sessionId: string,
+  operation: MuseTextGenerationOperation,
+): Effect.Effect<string, TextGenerationError> {
+  return Effect.gen(function* () {
+    const kindByItemId = yield* Ref.make(new Map<string, string>());
+    const textByItemId = yield* Ref.make(new Map<string, string>());
+    const done = yield* Deferred.make<string, TextGenerationError>();
+
+    yield* client.notifications.pipe(
+      Stream.runForEach((notification) =>
+        Effect.gen(function* () {
+          const params = notification.params as
+            | (Record<string, unknown> & { sessionId?: unknown })
+            | undefined;
+          if (!params || params.sessionId !== sessionId) return;
+
+          if (
+            notification.method === "item/started" ||
+            notification.method === "item/updated" ||
+            notification.method === "item/completed"
+          ) {
+            const item = (params as { item?: Record<string, unknown> }).item;
+            if (!item || typeof item.itemId !== "string" || typeof item.kind !== "string") return;
+            yield* Ref.update(kindByItemId, (current) =>
+              new Map(current).set(item.itemId as string, item.kind as string),
+            );
+            if (
+              notification.method === "item/completed" &&
+              item.kind === "agentMessage" &&
+              typeof item.fallbackText === "string"
+            ) {
+              yield* Ref.update(textByItemId, (current) => {
+                const existing = current.get(item.itemId as string);
+                if (existing && existing.length > 0) return current;
+                return new Map(current).set(item.itemId as string, String(item.fallbackText));
+              });
             }
-            if (notification.method === "item/completed") {
-              const item = (params as { item?: Record<string, unknown> }).item;
-              if (item?.kind === "agentMessage" && typeof item.fallbackText === "string") {
-                yield* Ref.update(textRef, (current) =>
-                  current.length > 0 ? current : String(item.fallbackText),
-                );
-              }
-              return false;
+            return;
+          }
+
+          if (notification.method === "item/delta") {
+            const delta = params as { delta?: unknown; field?: unknown; itemId?: unknown };
+            if (typeof delta.itemId !== "string" || typeof delta.delta !== "string") return;
+            if (delta.field !== undefined && delta.field !== "text") return;
+            const kinds = yield* Ref.get(kindByItemId);
+            // Deltas can arrive before this item's own `item/started`; only
+            // agentMessage text is ever this call's answer.
+            if (kinds.get(delta.itemId) !== "agentMessage") return;
+            yield* Ref.update(textByItemId, (current) =>
+              new Map(current).set(
+                delta.itemId as string,
+                (current.get(delta.itemId as string) ?? "") + delta.delta,
+              ),
+            );
+            return;
+          }
+
+          if (notification.method === "turn/completed") {
+            const terminal = (params as { terminal?: unknown }).terminal;
+            if (terminal !== "completed") {
+              const errorMessage = (params as { error?: { message?: unknown } }).error?.message;
+              yield* Deferred.fail(
+                done,
+                new TextGenerationError({
+                  operation,
+                  detail:
+                    typeof errorMessage === "string"
+                      ? `Muse turn ${String(terminal)}: ${errorMessage}`
+                      : `Muse turn ended without completing (terminal: ${String(terminal)}).`,
+                }),
+              );
+              return;
             }
-            return notification.method === "turn/completed";
+            const textByItem = yield* Ref.get(textByItemId);
+            yield* Deferred.succeed(done, Array.from(textByItem.values()).join(""));
+          }
+        }),
+      ),
+      Effect.catchCause((cause) =>
+        Deferred.fail(
+          done,
+          new TextGenerationError({
+            operation,
+            detail: "Muse connection closed before the response completed.",
+            cause,
           }),
         ),
-        Stream.takeUntil((done) => done),
-        Stream.runDrain,
-        Effect.andThen(Ref.get(textRef)),
       ),
-    ),
-  );
+      Effect.forkChild,
+    );
+
+    return yield* Deferred.await(done);
+  });
 }

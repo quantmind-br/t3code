@@ -30,8 +30,6 @@ import { JsonRpcResponseEnvelope } from "./_internal/shared.ts";
 
 const isJsonRpcResponseEnvelope = Schema.is(JsonRpcResponseEnvelope);
 const isMspError = Schema.is(MspError.MspError);
-const MAX_BUFFERED_NOTIFICATIONS = 256;
-
 export interface MspProtocolLogEvent {
   readonly direction: "incoming" | "outgoing";
   readonly stage: "raw" | "decoded" | "decode_failed";
@@ -53,7 +51,7 @@ export interface MspPatchedProtocolOptions {
 }
 
 export interface MspPatchedProtocol {
-  readonly incomingNotifications: Stream.Stream<MspIncomingNotification>;
+  readonly incomingNotifications: Stream.Stream<MspIncomingNotification, MspError.MspError>;
   readonly request: (
     method: string,
     payload?: unknown,
@@ -115,9 +113,13 @@ export const makeMspPatchedProtocol = Effect.fn("makeMspPatchedProtocol")(functi
   options: MspPatchedProtocolOptions,
 ): Effect.fn.Return<MspPatchedProtocol, never, Scope.Scope> {
   const outgoing = yield* Queue.unbounded<string, Cause.Done<void>>();
-  const incomingNotifications = yield* Queue.sliding<MspIncomingNotification>(
-    MAX_BUFFERED_NOTIFICATIONS,
-  );
+  // Unbounded and lossless: MuseAdapter derives item/approval state from these
+  // notifications, so a sliding/dropping buffer could silently lose content
+  // a consumer never gets a chance to recover.
+  const incomingNotifications = yield* Queue.unbounded<
+    MspIncomingNotification,
+    MspError.MspError
+  >();
   const pending = yield* Ref.make(new Map<string, MspPendingRequest>());
   const nextRequestId = yield* Ref.make(1);
   const remainder: Array<string> = [];
@@ -153,6 +155,7 @@ export const makeMspPatchedProtocol = Effect.fn("makeMspPatchedProtocol")(functi
           yield* Ref.set(terminationFailure, Option.some(error));
           yield* failAllPending(error);
           yield* Queue.end(outgoing);
+          yield* Queue.fail(incomingNotifications, error);
           yield* Deferred.succeed(terminationSignal, undefined);
           if (options.onTermination) yield* options.onTermination(error);
         }),
@@ -282,7 +285,15 @@ export const makeMspPatchedProtocol = Effect.fn("makeMspPatchedProtocol")(functi
     Effect.forkScoped,
   );
 
-  yield* Stream.fromQueue(outgoing).pipe(Stream.run(options.stdio.stdout()), Effect.forkScoped);
+  yield* Stream.fromQueue(outgoing).pipe(
+    Stream.run(options.stdio.stdout()),
+    Effect.catchCause((cause) =>
+      handleTermination(() =>
+        Effect.succeed(normalizeError(Cause.squash(cause), "write-output-stream")),
+      ),
+    ),
+    Effect.forkScoped,
+  );
 
   const request = (method: string, payload?: unknown) =>
     Effect.gen(function* () {

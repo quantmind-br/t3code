@@ -25,6 +25,9 @@ export interface MspClientOptions {
   readonly command: string;
   readonly args: ReadonlyArray<string>;
   readonly env?: Record<string, string | undefined>;
+  /** Windows `.cmd`/`.bat` launchers need `shell: true` to run at all; see
+   * `@t3tools/shared/shell#resolveSpawnCommand`. */
+  readonly shell?: boolean | string;
   readonly cwd?: string;
   readonly logIncoming?: boolean;
   readonly logOutgoing?: boolean;
@@ -55,7 +58,7 @@ export interface MspNotification {
 }
 
 export interface MspClient {
-  readonly notifications: Stream.Stream<MspNotification>;
+  readonly notifications: Stream.Stream<MspNotification, MspError.MspError>;
   readonly initialize: (
     params: MspSchema.InitializeParams,
   ) => Effect.Effect<MspSchema.InitializeResult, MspError.MspError>;
@@ -107,11 +110,19 @@ export interface MspClient {
  */
 export const makeOverStdio = Effect.fn("effect-msp/makeOverStdio")(function* (
   stdio: Stdio.Stdio,
-  options: { readonly terminationError?: Effect.Effect<MspError.MspError> } = {},
+  options: {
+    readonly terminationError?: Effect.Effect<MspError.MspError>;
+    readonly logIncoming?: boolean;
+    readonly logOutgoing?: boolean;
+    readonly logger?: (event: MspProtocol.MspProtocolLogEvent) => Effect.Effect<void, never>;
+  } = {},
 ): Effect.fn.Return<MspClient, never, Scope.Scope> {
   const protocol = yield* MspProtocol.makeMspPatchedProtocol({
     stdio,
     ...(options.terminationError ? { terminationError: options.terminationError } : {}),
+    ...(options.logIncoming !== undefined ? { logIncoming: options.logIncoming } : {}),
+    ...(options.logOutgoing !== undefined ? { logOutgoing: options.logOutgoing } : {}),
+    ...(options.logger ? { logger: options.logger } : {}),
   });
 
   const call = <A, I>(method: string, schema: Schema.Codec<A, I>, payload: unknown) =>
@@ -161,12 +172,18 @@ export const spawn = Effect.fn("effect-msp/spawn")(function* (
       ChildProcess.make(options.command, options.args, {
         cwd: options.cwd,
         env: options.env,
+        ...(options.shell !== undefined ? { shell: options.shell } : {}),
       }),
     )
     .pipe(
       Effect.mapError((cause) => new MspError.MspSpawnError({ command: options.command, cause })),
     );
 
-  const stdio = makeChildStdio(handle);
-  return yield* makeOverStdio(stdio, { terminationError: makeTerminationError(handle) });
+  const stdio = yield* makeChildStdio(handle);
+  return yield* makeOverStdio(stdio, {
+    terminationError: makeTerminationError(handle),
+    ...(options.logIncoming !== undefined ? { logIncoming: options.logIncoming } : {}),
+    ...(options.logOutgoing !== undefined ? { logOutgoing: options.logOutgoing } : {}),
+    ...(options.logger ? { logger: options.logger } : {}),
+  });
 });

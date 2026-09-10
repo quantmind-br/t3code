@@ -36,6 +36,7 @@ import {
   type ProviderInstanceId,
   type ProviderRuntimeEvent,
   type ProviderSendTurnInput,
+  type RuntimeMode,
   type ProviderSession,
   type ProviderSessionStartInput,
   type ProviderUserInputAnswers,
@@ -99,6 +100,11 @@ interface PendingApproval {
   readonly availableChoices: ReadonlyArray<MspSchema.ApprovalChoice>;
   readonly currentRequirementId: MspSchema.ApprovalRequirementRef;
   readonly sessionId: string;
+  readonly turnId: string;
+  readonly itemId: string;
+  readonly toolName: string;
+  readonly rawArgs: string;
+  readonly subject: Record<string, unknown>;
 }
 
 interface MuseThreadState {
@@ -115,6 +121,27 @@ interface MuseThreadState {
   readonly items: Ref.Ref<Array<MspSchema.Item>>;
   readonly itemKindByItemId: Ref.Ref<Map<string, string>>;
   readonly createdAt: string;
+  readonly runtimeMode: Ref.Ref<RuntimeMode>;
+  readonly modelId: Ref.Ref<string | undefined>;
+}
+
+/**
+ * Maps T3's coarse `RuntimeMode` onto MSP's `ApprovalMode`. Best-effort:
+ * MSP has 4 modes to T3's 4, but the semantics don't line up 1:1
+ * (`auto-accept-edits` has no direct MSP equivalent) — `promptUnmatched`
+ * (auto-approve well-understood actions, prompt for the rest) is the
+ * closest fit for both `auto` and `auto-accept-edits`.
+ */
+function runtimeModeToApprovalMode(mode: RuntimeMode): MspSchema.ApprovalMode {
+  switch (mode) {
+    case "full-access":
+      return "allowAll";
+    case "approval-required":
+      return "onRequest";
+    case "auto-accept-edits":
+    case "auto":
+      return "promptUnmatched";
+  }
 }
 
 /**
@@ -243,6 +270,15 @@ export const makeMuseAdapter = Effect.fn("makeMuseAdapter")(function* (
       Effect.catchCause((cause) =>
         Effect.gen(function* () {
           const base = yield* emitBase({ threadId: state.threadId });
+          // The host connection is gone: nothing more will ever come from it,
+          // so drop the thread from the live map now rather than leaving
+          // `hasSession`/`listSessions` report a session that can no longer
+          // accept turns or answer approvals.
+          yield* Ref.update(threads, (current) => {
+            const next = new Map(current);
+            next.delete(state.threadId);
+            return next;
+          });
           yield* emit({
             ...base,
             type: "session.exited",
@@ -325,8 +361,10 @@ export const makeMuseAdapter = Effect.fn("makeMuseAdapter")(function* (
               : notification.method === "item/updated"
                 ? "item.updated"
                 : "item.completed";
+          const activeTurnId = yield* Ref.get(state.activeTurnId);
           yield* emit({
             ...base,
+            ...(Option.isSome(activeTurnId) ? { turnId: activeTurnId.value } : {}),
             itemId: RuntimeItemId.make(item.itemId),
             type: eventType,
             payload: {
@@ -343,12 +381,25 @@ export const makeMuseAdapter = Effect.fn("makeMuseAdapter")(function* (
           yield* Ref.set(state.viewCursor, params.value.viewCursor);
           const kinds = yield* Ref.get(state.itemKindByItemId);
           const kind = kinds.get(params.value.itemId);
+          // Only "agentMessage" text is ever the model's answer; tool/shell
+          // output and unmapped item kinds must never masquerade as
+          // assistant text downstream.
+          const streamKind =
+            kind === "agentMessage"
+              ? "assistant_text"
+              : kind === "reasoning"
+                ? "reasoning_text"
+                : kind === "toolCall" || kind === "userShell"
+                  ? "command_output"
+                  : "unknown";
+          const activeTurnId = yield* Ref.get(state.activeTurnId);
           yield* emit({
             ...base,
+            ...(Option.isSome(activeTurnId) ? { turnId: activeTurnId.value } : {}),
             itemId: RuntimeItemId.make(params.value.itemId),
             type: "content.delta",
             payload: {
-              streamKind: kind === "reasoning" ? "reasoning_text" : "assistant_text",
+              streamKind,
               delta: params.value.delta,
             },
           } as ProviderRuntimeEvent);
@@ -364,6 +415,11 @@ export const makeMuseAdapter = Effect.fn("makeMuseAdapter")(function* (
               availableChoices: p.availableChoices,
               currentRequirementId: p.currentRequirementId,
               sessionId: p.sessionId,
+              turnId: p.turnId,
+              itemId: p.itemId,
+              toolName: p.toolName,
+              rawArgs: p.rawArgs,
+              subject: p.subject as Record<string, unknown>,
             }),
           );
           yield* emit({
@@ -374,7 +430,10 @@ export const makeMuseAdapter = Effect.fn("makeMuseAdapter")(function* (
             type: "request.opened",
             payload: {
               requestType: "unknown",
-              detail: p.toolName,
+              // Show the actual operation being authorized, not just the
+              // tool name, so approval is an informed decision.
+              detail: p.rawArgs.trim().length > 0 ? p.rawArgs : p.toolName,
+              args: { toolName: p.toolName, rawArgs: p.rawArgs, subject: p.subject },
               options: p.availableChoices.map((choice) => ({
                 decision: mapMspDecisionToProvider(choice.decision),
                 label: choice.label,
@@ -384,19 +443,50 @@ export const makeMuseAdapter = Effect.fn("makeMuseAdapter")(function* (
           return;
         }
         case "approval/updated": {
-          // Re-issued pending set with a fresh stage; refresh what respondToRequest reads.
           const params = yield* decode(MspSchema.ApprovalUpdatedParams);
           if (Option.isNone(params)) return;
           yield* Ref.set(state.viewCursor, params.value.viewCursor);
-          yield* Ref.update(state.pendingApprovals, (current) => {
+          const updated = yield* Ref.modify(state.pendingApprovals, (current) => {
             const existing = current.get(params.value.approvalId);
-            if (!existing) return current;
-            return new Map(current).set(params.value.approvalId, {
+            if (!existing) return [Option.none<PendingApproval>(), current] as const;
+            const next: PendingApproval = {
               ...existing,
               availableChoices: params.value.availableChoices,
               currentRequirementId: params.value.currentRequirementId,
-            });
+            };
+            return [
+              Option.some(next),
+              new Map(current).set(params.value.approvalId, next),
+            ] as const;
           });
+          // Re-issued pending set with a fresh stage: re-emit `request.opened`
+          // for the same request ID with the new choices so the client's
+          // approval card offers the current, not stale, options.
+          if (Option.isSome(updated)) {
+            yield* emit({
+              ...base,
+              turnId: TurnId.make(updated.value.turnId),
+              itemId: RuntimeItemId.make(updated.value.itemId),
+              requestId: RuntimeRequestId.make(params.value.approvalId),
+              type: "request.opened",
+              payload: {
+                requestType: "unknown",
+                detail:
+                  updated.value.rawArgs.trim().length > 0
+                    ? updated.value.rawArgs
+                    : updated.value.toolName,
+                args: {
+                  toolName: updated.value.toolName,
+                  rawArgs: updated.value.rawArgs,
+                  subject: updated.value.subject,
+                },
+                options: updated.value.availableChoices.map((choice) => ({
+                  decision: mapMspDecisionToProvider(choice.decision),
+                  label: choice.label,
+                })),
+              },
+            } as ProviderRuntimeEvent);
+          }
           return;
         }
         case "approval/resolved": {
@@ -449,18 +539,29 @@ export const makeMuseAdapter = Effect.fn("makeMuseAdapter")(function* (
           return;
         }
         case "userInput/settled": {
-          const raw = notification.params as
-            | { userInputId?: unknown; viewCursor?: unknown }
-            | undefined;
-          if (raw && typeof raw.viewCursor === "string") {
-            yield* Ref.set(state.viewCursor, raw.viewCursor);
-          }
-          if (raw && typeof raw.userInputId === "string") {
-            yield* Ref.update(state.pendingUserInputs, (current) => {
-              const next = new Map(current);
-              next.delete(raw.userInputId as string);
-              return next;
-            });
+          const params = yield* decode(MspSchema.UserInputSettledParams);
+          if (Option.isNone(params)) return;
+          yield* Ref.set(state.viewCursor, params.value.viewCursor);
+          const pending = yield* Ref.modify(state.pendingUserInputs, (current) => {
+            const existing = current.get(params.value.userInputId);
+            if (!existing)
+              return [Option.none<MspSchema.UserInputRequestParams>(), current] as const;
+            const next = new Map(current);
+            next.delete(params.value.userInputId);
+            return [Option.some(existing), next] as const;
+          });
+          // A settlement this adapter didn't cause locally (timeout,
+          // interruption, or another client answering) still needs to close
+          // the request in T3, or the question stays visibly pending forever.
+          if (Option.isSome(pending)) {
+            yield* emit({
+              ...base,
+              turnId: TurnId.make(pending.value.turnId),
+              itemId: RuntimeItemId.make(pending.value.itemId),
+              requestId: RuntimeRequestId.make(params.value.userInputId),
+              type: "user-input.resolved",
+              payload: { answers: {} },
+            } as ProviderRuntimeEvent);
           }
           return;
         }
@@ -514,6 +615,21 @@ export const makeMuseAdapter = Effect.fn("makeMuseAdapter")(function* (
   ): Effect.Effect<ProviderSession, ProviderAdapterError> =>
     Effect.gen(function* () {
       const scope = yield* Scope.make();
+      // Nothing is reachable through `threads` until the whole startup
+      // sequence below succeeds. If any step in it fails or is interrupted
+      // (spawn, initialize, session/start|resume all included), close this
+      // scope here so the spawned host process and its reader/writer fibers
+      // don't leak — `stopAll` can only find threads already in the map.
+      return yield* startSessionInScope(input, scope).pipe(
+        Effect.tapCause((cause) => Scope.close(scope, Exit.failCause(cause))),
+      );
+    });
+
+  const startSessionInScope = (
+    input: ProviderSessionStartInput,
+    scope: Scope.Closeable,
+  ): Effect.Effect<ProviderSession, ProviderAdapterError> =>
+    Effect.gen(function* () {
       const cwd = input.cwd;
       const resumeCursor = parseMuseResumeCursor(input.resumeCursor);
 
@@ -531,6 +647,7 @@ export const makeMuseAdapter = Effect.fn("makeMuseAdapter")(function* (
             args: spawnCommand.args,
             env: options.environment,
             ...(cwd ? { cwd } : {}),
+            shell: spawnCommand.shell,
           }),
         ),
         Effect.provideService(ChildProcessSpawner.ChildProcessSpawner, spawner),
@@ -543,6 +660,7 @@ export const makeMuseAdapter = Effect.fn("makeMuseAdapter")(function* (
         .pipe(Effect.mapError(mapMspError(input.threadId, "initialize")));
 
       const commandId = yield* randomUuidV7;
+      const approvalMode = runtimeModeToApprovalMode(input.runtimeMode);
       const startResult = resumeCursor
         ? yield* client
             .sessionResume({
@@ -557,10 +675,36 @@ export const makeMuseAdapter = Effect.fn("makeMuseAdapter")(function* (
         : yield* client
             .sessionStart({
               commandId,
+              approvalMode,
               ...(cwd ? { workspaceRoot: cwd } : {}),
               ...(input.modelSelection?.model ? { modelId: input.modelSelection.model } : {}),
             })
             .pipe(Effect.mapError(mapMspError(input.threadId, "session/start")));
+
+      if (resumeCursor) {
+        // `session/resume` doesn't accept `approvalMode`/`modelId`; apply
+        // both explicitly afterward so a resumed session honors the current
+        // request's runtime mode and model instead of silently keeping
+        // whatever the host had configured on a previous connection.
+        const setApprovalCommandId = yield* randomUuidV7;
+        yield* client
+          .sessionSetApprovalMode({
+            commandId: setApprovalCommandId,
+            mode: approvalMode,
+            sessionId: startResult.session.sessionId,
+          })
+          .pipe(Effect.mapError(mapMspError(input.threadId, "session/setApprovalMode")));
+        if (input.modelSelection?.model) {
+          const setModelCommandId = yield* randomUuidV7;
+          yield* client
+            .sessionSetModel({
+              commandId: setModelCommandId,
+              model: { modelId: input.modelSelection.model },
+              sessionId: startResult.session.sessionId,
+            })
+            .pipe(Effect.mapError(mapMspError(input.threadId, "session/setModel")));
+        }
+      }
 
       const sessionCreatedAt = yield* nowIso;
       const state: MuseThreadState = {
@@ -570,19 +714,114 @@ export const makeMuseAdapter = Effect.fn("makeMuseAdapter")(function* (
         museSessionId: startResult.session.sessionId,
         cwd,
         viewCursor: yield* Ref.make(startResult.viewCursor),
-        activeTurnId: yield* Ref.make(Option.none<TurnId>()),
+        activeTurnId: yield* Ref.make(
+          startResult.session.activeTurnId
+            ? Option.some(TurnId.make(startResult.session.activeTurnId))
+            : Option.none<TurnId>(),
+        ),
         pendingApprovals: yield* Ref.make(new Map<string, PendingApproval>()),
         pendingUserInputs: yield* Ref.make(new Map<string, MspSchema.UserInputRequestParams>()),
         items: yield* Ref.make<Array<MspSchema.Item>>([]),
         itemKindByItemId: yield* Ref.make(new Map<string, string>()),
         createdAt: sessionCreatedAt,
+        runtimeMode: yield* Ref.make(input.runtimeMode),
+        modelId: yield* Ref.make(input.modelSelection?.model),
       };
+      // A reconnect for a thread that already has a live host (e.g. a resume
+      // racing an existing session) must not leak the old scope/process.
+      const previous = (yield* Ref.get(threads)).get(input.threadId);
+      if (previous) yield* Scope.close(previous.scope, Exit.void).pipe(Effect.ignore);
       yield* Ref.update(threads, (current) => new Map(current).set(input.threadId, state));
       yield* attachNotificationConsumer(state);
       yield* Scope.addFinalizer(
         scope,
         Effect.sync(() => undefined),
       );
+
+      if (resumeCursor) {
+        // Resume drops in-flight approval/user-input requests unless they're
+        // explicitly reconciled: without this, a session restored while
+        // waiting on one answers as "unknown request" forever.
+        const pendingRequestsBase = yield* emitBase({ threadId: input.threadId });
+        const pending = yield* client
+          .approvalListPending({ sessionId: state.museSessionId })
+          .pipe(Effect.mapError(mapMspError(input.threadId, "approval/listPending")));
+        yield* Ref.set(
+          state.pendingApprovals,
+          new Map(
+            pending.approvals.map(
+              (p) =>
+                [
+                  p.approvalId,
+                  {
+                    availableChoices: p.availableChoices,
+                    currentRequirementId: p.currentRequirementId,
+                    sessionId: p.sessionId,
+                    turnId: p.turnId,
+                    itemId: p.itemId,
+                    toolName: p.toolName,
+                    rawArgs: p.rawArgs,
+                    subject: p.subject as Record<string, unknown>,
+                  },
+                ] as const,
+            ),
+          ),
+        );
+        yield* Effect.forEach(
+          pending.approvals,
+          (p) =>
+            emit({
+              ...pendingRequestsBase,
+              turnId: TurnId.make(p.turnId),
+              itemId: RuntimeItemId.make(p.itemId),
+              requestId: RuntimeRequestId.make(p.approvalId),
+              type: "request.opened",
+              payload: {
+                requestType: "unknown",
+                detail: p.rawArgs.trim().length > 0 ? p.rawArgs : p.toolName,
+                args: { toolName: p.toolName, rawArgs: p.rawArgs, subject: p.subject },
+                options: p.availableChoices.map((choice) => ({
+                  decision: mapMspDecisionToProvider(choice.decision),
+                  label: choice.label,
+                })),
+              },
+            } as ProviderRuntimeEvent),
+          { discard: true },
+        );
+        const decodedUserInputs = yield* Effect.forEach(pending.userInputs, (raw) =>
+          Schema.decodeUnknownEffect(MspSchema.UserInputRequestParams)(raw).pipe(Effect.option),
+        );
+        const userInputs = decodedUserInputs.filter(Option.isSome).map((decoded) => decoded.value);
+        yield* Ref.set(
+          state.pendingUserInputs,
+          new Map(userInputs.map((p) => [p.userInputId, p] as const)),
+        );
+        yield* Effect.forEach(
+          userInputs,
+          (p) =>
+            emit({
+              ...pendingRequestsBase,
+              turnId: TurnId.make(p.turnId),
+              itemId: RuntimeItemId.make(p.itemId),
+              requestId: RuntimeRequestId.make(p.userInputId),
+              type: "user-input.requested",
+              payload: {
+                questions: p.questions.map((question) => ({
+                  id: question.id,
+                  header: question.header,
+                  question: question.question,
+                  options: question.options.map((option) => ({
+                    label: option.label,
+                    description: option.description ?? "",
+                  })),
+                  allowCustomAnswer: true,
+                  multiSelect: question.selection.mode === "multiple",
+                })),
+              },
+            } as ProviderRuntimeEvent),
+          { discard: true },
+        );
+      }
 
       const base = yield* emitBase({ threadId: input.threadId });
       yield* emit({
@@ -631,6 +870,20 @@ export const makeMuseAdapter = Effect.fn("makeMuseAdapter")(function* (
           operation: "sendTurn",
           issue: "Muse requires non-empty turn input; promptless continuation is not supported.",
         });
+      }
+      if (input.modelSelection?.model) {
+        const currentModel = yield* Ref.get(state.modelId);
+        if (currentModel !== input.modelSelection.model) {
+          const setModelCommandId = yield* randomUuidV7;
+          yield* state.client
+            .sessionSetModel({
+              commandId: setModelCommandId,
+              model: { modelId: input.modelSelection.model },
+              sessionId: state.museSessionId,
+            })
+            .pipe(Effect.mapError(mapMspError(input.threadId, "session/setModel")));
+          yield* Ref.set(state.modelId, input.modelSelection.model);
+        }
       }
       const commandId = yield* randomUuidV7;
       const result = yield* state.client
@@ -714,7 +967,16 @@ export const makeMuseAdapter = Effect.fn("makeMuseAdapter")(function* (
       const mspAnswers: Array<MspSchema.UserInputAnswer> = pending.questions.map((question) => {
         const raw = answers[question.id];
         if (Array.isArray(raw)) return { questionId: question.id, selectedLabels: raw.map(String) };
-        if (typeof raw === "string") return { questionId: question.id, freeText: raw };
+        if (typeof raw === "string") {
+          // The web client sends a single selected option as a plain string,
+          // not an array — match it against the offered labels so a real
+          // selection uses MSP's `selectedLabel`, reserving `freeText` for
+          // genuinely custom answers.
+          const matchesOption = question.options.some((option) => option.label === raw);
+          return matchesOption
+            ? { questionId: question.id, selectedLabel: raw }
+            : { questionId: question.id, freeText: raw };
+        }
         return { questionId: question.id, freeText: raw === undefined ? "" : JSON.stringify(raw) };
       });
       yield* state.client
@@ -740,21 +1002,25 @@ export const makeMuseAdapter = Effect.fn("makeMuseAdapter")(function* (
 
   const listSessions = () =>
     Ref.get(threads).pipe(
-      Effect.map((current) =>
-        Array.from(current.values()).map((state): ProviderSession => ({
-          provider: PROVIDER,
-          providerInstanceId: options.instanceId,
-          status: "ready",
-          runtimeMode: "full-access",
-          ...(state.cwd ? { cwd: state.cwd } : {}),
-          threadId: state.threadId,
-          resumeCursor: {
-            schemaVersion: RESUME_CURSOR_VERSION,
-            museSessionId: state.museSessionId,
-          },
-          createdAt: state.createdAt,
-          updatedAt: state.createdAt,
-        })),
+      Effect.flatMap((current) =>
+        Effect.forEach(Array.from(current.values()), (state) =>
+          Ref.get(state.runtimeMode).pipe(
+            Effect.map((runtimeMode): ProviderSession => ({
+              provider: PROVIDER,
+              providerInstanceId: options.instanceId,
+              status: "ready",
+              runtimeMode,
+              ...(state.cwd ? { cwd: state.cwd } : {}),
+              threadId: state.threadId,
+              resumeCursor: {
+                schemaVersion: RESUME_CURSOR_VERSION,
+                museSessionId: state.museSessionId,
+              },
+              createdAt: state.createdAt,
+              updatedAt: state.createdAt,
+            })),
+          ),
+        ),
       ),
     );
 
@@ -807,9 +1073,29 @@ export const makeMuseAdapter = Effect.fn("makeMuseAdapter")(function* (
         Effect.gen(function* () {
           const state = yield* requireThread(threadId);
           const commandId = yield* randomUuidV7;
-          yield* state.client
+          const result = yield* state.client
             .sessionCompact({ commandId, sessionId: state.museSessionId })
-            .pipe(Effect.mapError(mapMspError(threadId, "session/compact")), Effect.asVoid);
+            .pipe(Effect.mapError(mapMspError(threadId, "session/compact")));
+          const base = yield* emitBase({ threadId });
+          // `ProviderService`/runtime ingestion complete a compaction request
+          // off the canonical `thread.state.changed(compacted)` event, not
+          // the item-lifecycle events Muse emits for the compaction item
+          // itself — without this, the request just times out. A rejected or
+          // skipped compaction (`result.reason` set) is surfaced instead of
+          // silently discarded.
+          if (result.reason) {
+            yield* emit({
+              ...base,
+              type: "runtime.warning",
+              payload: { message: `Muse did not compact this session: ${result.reason}` },
+            } as ProviderRuntimeEvent);
+            return;
+          }
+          yield* emit({
+            ...base,
+            type: "thread.state.changed",
+            payload: { state: "compacted" },
+          } as ProviderRuntimeEvent);
         }),
     },
     startSession,
