@@ -47,12 +47,13 @@ export const makeInMemoryStdio = Effect.fn("makeInMemoryStdio")(function* (optio
       stdout: () =>
         Sink.forEach((chunk: string | Uint8Array) =>
           (gate ? Deferred.await(gate) : Effect.void).pipe(
-            Effect.andThen(
-              Queue.offer(
-                output,
-                typeof chunk === "string" ? chunk : decoder.decode(chunk, { stream: true }),
-              ),
-            ),
+            Effect.andThen(() => {
+              const text =
+                typeof chunk === "string" ? chunk : decoder.decode(chunk, { stream: true });
+              // An empty write is a no-op on a real byte sink; keep the
+              // observable `output` queue faithful to what bytes would exist.
+              return text.length === 0 ? Effect.void : Queue.offer(output, text);
+            }),
           ),
         ),
       stderr: () => Sink.drain,

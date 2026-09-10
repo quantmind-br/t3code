@@ -14,6 +14,7 @@
  *
  * @module effect-msp/protocol
  */
+import * as Arr from "effect/Array";
 import * as Cause from "effect/Cause";
 import * as Deferred from "effect/Deferred";
 import * as Effect from "effect/Effect";
@@ -23,6 +24,7 @@ import * as Ref from "effect/Ref";
 import type * as Scope from "effect/Scope";
 import * as Schema from "effect/Schema";
 import * as Stdio from "effect/Stdio";
+import * as Sink from "effect/Sink";
 import * as Stream from "effect/Stream";
 
 import * as MspError from "./errors.ts";
@@ -315,32 +317,50 @@ export const makeMspPatchedProtocol = Effect.fn("makeMspPatchedProtocol")(functi
     Effect.forkScoped,
   );
 
-  // One explicit take → check → write loop rather than a Stream pipeline:
-  // stream stages buffer between each other, so a filter placed upstream of
-  // the sink would be evaluated for an entry long before the sink actually
-  // writes it, and a caller who gives up in between would still be sent.
-  // Checking `pending` immediately before each write is what closes that
-  // gap for a request whose caller already gave up (timeout/interrupt).
-  // A request already written is past this point and has an uncertain
-  // outcome by nature — that part is inherent to the protocol.
-  const writeOne = (entry: OutgoingEntry) =>
-    Effect.gen(function* () {
-      const requestId = entry.requestId;
-      if (requestId !== undefined) {
-        const live = (yield* Ref.get(pending)).has(requestId);
-        if (!live) return;
-      }
-      yield* Stream.make(entry.encoded).pipe(Stream.run(options.stdio.stdout()));
-    });
-  yield* Effect.forever(Queue.take(outgoing).pipe(Effect.flatMap(writeOne))).pipe(
-    Effect.catchCause((cause) =>
-      // `Queue.end(outgoing)` on termination surfaces as a `Done` failure
-      // from `Queue.take` — that is a normal shutdown, not a write error.
-      Cause.isDone(Cause.squash(cause))
-        ? Effect.void
-        : handleTermination(() =>
-            Effect.succeed(normalizeError(Cause.squash(cause), "write-output-stream")),
+  // ONE continuous sink for the connection's lifetime. Running a fresh
+  // finite stream into `options.stdio.stdout()` per frame would, for a real
+  // child (`makeChildStdio` wraps `handle.stdin`, whose default
+  // `endOnDone: true` ends the writable when the fed stream completes), close
+  // the host's stdin after the very first frame.
+  //
+  // The liveness check lives INSIDE the sink (`Sink.mapInputArrayEffect`), so
+  // it runs at the moment a chunk is handed to the writer, not in an upstream
+  // Stream stage that buffers ahead of it. A request whose caller already
+  // gave up (timeout/interrupt removed it from `pending`) before its frame
+  // reaches the sink is dropped here, so the host never runs work nobody is
+  // waiting on (e.g. a duplicate `turn/start` after the adapter retries with
+  // a fresh commandId). A frame already handed to the OS is past this point
+  // and has an uncertain outcome by nature — inherent to the protocol.
+  const liveFrames = (entries: Arr.NonEmptyReadonlyArray<OutgoingEntry>) =>
+    Ref.get(pending).pipe(
+      Effect.map((current) =>
+        entries
+          .filter((entry) => entry.requestId === undefined || current.has(entry.requestId))
+          .map((entry) => entry.encoded),
+      ),
+    );
+  yield* Stream.fromQueue(outgoing).pipe(
+    // One frame per chunk so the liveness check in the sink is evaluated per
+    // frame at the moment it is written, not once for a batch the queue
+    // happened to drain together while the pipe was blocked.
+    Stream.rechunk(1),
+    Stream.run(
+      options.stdio.stdout().pipe(
+        Sink.mapInputArrayEffect((entries: Arr.NonEmptyReadonlyArray<OutgoingEntry>) =>
+          liveFrames(entries).pipe(
+            // The sink contract wants a non-empty array; an all-dropped chunk
+            // becomes one empty string, which the byte sink writes as nothing.
+            Effect.map((frames) =>
+              Arr.isReadonlyArrayNonEmpty(frames) ? frames : ([""] as const),
+            ),
           ),
+        ),
+      ),
+    ),
+    Effect.catchCause((cause) =>
+      handleTermination(() =>
+        Effect.succeed(normalizeError(Cause.squash(cause), "write-output-stream")),
+      ),
     ),
     Effect.forkScoped,
   );

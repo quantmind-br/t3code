@@ -58,6 +58,7 @@ import * as PubSub from "effect/PubSub";
 import * as Ref from "effect/Ref";
 import * as Schema from "effect/Schema";
 import * as Scope from "effect/Scope";
+import * as Semaphore from "effect/Semaphore";
 import * as Stream from "effect/Stream";
 import { ChildProcessSpawner } from "effect/unstable/process";
 
@@ -149,6 +150,12 @@ interface MuseThreadState {
   readonly createdAt: string;
   readonly runtimeMode: Ref.Ref<RuntimeMode>;
   readonly modelId: Ref.Ref<string | undefined>;
+  /** Serializes session-changing operations (turn start/interrupt, rollback,
+   * compaction) on this thread. ProviderService offers no cross-operation
+   * lock, and `activeTurnId` is only set asynchronously by `turn/started`, so
+   * without this a `sendTurn` could slip in between rollback's read of the
+   * source session and its switch to the replacement. */
+  readonly sessionLock: Semaphore.Semaphore;
 }
 
 /**
@@ -312,6 +319,15 @@ export const makeMuseAdapter = Effect.fn("makeMuseAdapter")(function* (
           ? Effect.succeed(state)
           : Effect.fail(new ProviderAdapterSessionNotFoundError({ provider: PROVIDER, threadId }));
       }),
+    );
+
+  /** `requireThread` + run `body` holding that thread's `sessionLock`. */
+  const withThreadLock = <A, E>(
+    threadId: ThreadId,
+    body: (state: MuseThreadState) => Effect.Effect<A, E>,
+  ): Effect.Effect<A, E | ProviderAdapterSessionNotFoundError> =>
+    requireThread(threadId).pipe(
+      Effect.flatMap((state) => state.sessionLock.withPermit(body(state))),
     );
 
   const mapMspError = (threadId: ThreadId, operation: string) => (cause: MspError.MspError) => {
@@ -879,6 +895,7 @@ export const makeMuseAdapter = Effect.fn("makeMuseAdapter")(function* (
         createdAt: sessionCreatedAt,
         runtimeMode: yield* Ref.make(input.runtimeMode),
         modelId: yield* Ref.make(input.modelSelection?.model),
+        sessionLock: yield* Semaphore.make(1),
       };
       if (startResult.historyItems) {
         // Seed item-kind/content state from the resumed session's history
@@ -1045,68 +1062,70 @@ export const makeMuseAdapter = Effect.fn("makeMuseAdapter")(function* (
   const sendTurn = (
     input: ProviderSendTurnInput,
   ): Effect.Effect<ProviderTurnStartResult, ProviderAdapterError> =>
-    Effect.gen(function* () {
-      const state = yield* requireThread(input.threadId);
-      const museSessionId = yield* Ref.get(state.museSessionId);
-      if (input.attachments && input.attachments.length > 0) {
-        const base = yield* emitBase({ threadId: input.threadId });
-        yield* emit({
-          ...base,
-          type: "runtime.warning",
-          payload: {
-            message: `Muse turns are text-only in this integration; ${input.attachments.length} attachment(s) were not sent.`,
-          },
-        } as ProviderRuntimeEvent);
-      }
-      if (!input.input || input.input.trim().length === 0) {
-        return yield* new ProviderAdapterValidationError({
-          provider: PROVIDER,
-          operation: "sendTurn",
-          issue: "Muse requires non-empty turn input; promptless continuation is not supported.",
-        });
-      }
-      if (input.modelSelection?.model) {
-        const currentModel = yield* Ref.get(state.modelId);
-        if (currentModel !== input.modelSelection.model) {
-          const setModelCommandId = yield* randomUuidV7;
-          yield* state.client
-            .sessionSetModel({
-              commandId: setModelCommandId,
-              model: { modelId: input.modelSelection.model },
-              sessionId: museSessionId,
-            })
-            .pipe(Effect.mapError(mapMspError(input.threadId, "session/setModel")));
-          yield* Ref.set(state.modelId, input.modelSelection.model);
+    withThreadLock(input.threadId, (state) =>
+      Effect.gen(function* () {
+        const museSessionId = yield* Ref.get(state.museSessionId);
+        if (input.attachments && input.attachments.length > 0) {
+          const base = yield* emitBase({ threadId: input.threadId });
+          yield* emit({
+            ...base,
+            type: "runtime.warning",
+            payload: {
+              message: `Muse turns are text-only in this integration; ${input.attachments.length} attachment(s) were not sent.`,
+            },
+          } as ProviderRuntimeEvent);
         }
-      }
-      const commandId = yield* randomUuidV7;
-      const result = yield* state.client
-        .turnStart({
-          commandId,
-          input: [{ type: "text", text: input.input }],
-          sessionId: museSessionId,
-        })
-        .pipe(Effect.mapError(mapMspError(input.threadId, "turn/start")));
+        if (!input.input || input.input.trim().length === 0) {
+          return yield* new ProviderAdapterValidationError({
+            provider: PROVIDER,
+            operation: "sendTurn",
+            issue: "Muse requires non-empty turn input; promptless continuation is not supported.",
+          });
+        }
+        if (input.modelSelection?.model) {
+          const currentModel = yield* Ref.get(state.modelId);
+          if (currentModel !== input.modelSelection.model) {
+            const setModelCommandId = yield* randomUuidV7;
+            yield* state.client
+              .sessionSetModel({
+                commandId: setModelCommandId,
+                model: { modelId: input.modelSelection.model },
+                sessionId: museSessionId,
+              })
+              .pipe(Effect.mapError(mapMspError(input.threadId, "session/setModel")));
+            yield* Ref.set(state.modelId, input.modelSelection.model);
+          }
+        }
+        const commandId = yield* randomUuidV7;
+        const result = yield* state.client
+          .turnStart({
+            commandId,
+            input: [{ type: "text", text: input.input }],
+            sessionId: museSessionId,
+          })
+          .pipe(Effect.mapError(mapMspError(input.threadId, "turn/start")));
 
-      return {
-        threadId: input.threadId,
-        turnId: TurnId.make(result.turnId),
-        resumeCursor: { schemaVersion: RESUME_CURSOR_VERSION, museSessionId },
-      } satisfies ProviderTurnStartResult;
-    });
+        return {
+          threadId: input.threadId,
+          turnId: TurnId.make(result.turnId),
+          resumeCursor: { schemaVersion: RESUME_CURSOR_VERSION, museSessionId },
+        } satisfies ProviderTurnStartResult;
+      }),
+    );
 
   const interruptTurn = (
     threadId: ThreadId,
     turnId?: TurnId,
   ): Effect.Effect<void, ProviderAdapterError> =>
-    Effect.gen(function* () {
-      const state = yield* requireThread(threadId);
-      const commandId = yield* randomUuidV7;
-      const sessionId = yield* Ref.get(state.museSessionId);
-      yield* state.client
-        .turnInterrupt({ commandId, sessionId, ...(turnId ? { turnId } : {}) })
-        .pipe(Effect.mapError(mapMspError(threadId, "turn/interrupt")), Effect.asVoid);
-    });
+    withThreadLock(threadId, (state) =>
+      Effect.gen(function* () {
+        const commandId = yield* randomUuidV7;
+        const sessionId = yield* Ref.get(state.museSessionId);
+        yield* state.client
+          .turnInterrupt({ commandId, sessionId, ...(turnId ? { turnId } : {}) })
+          .pipe(Effect.mapError(mapMspError(threadId, "turn/interrupt")), Effect.asVoid);
+      }),
+    );
 
   const respondToRequest = (
     threadId: ThreadId,
@@ -1292,109 +1311,148 @@ export const makeMuseAdapter = Effect.fn("makeMuseAdapter")(function* (
           issue: "numTurns must be an integer >= 1.",
         });
       }
-      const state = yield* requireThread(threadId);
-      if (Option.isSome(yield* Ref.get(state.activeTurnId))) {
-        return yield* new ProviderAdapterValidationError({
-          provider: PROVIDER,
-          operation: "rollbackThread",
-          issue: "Cannot rewind while a Muse turn is running; interrupt it first.",
-        });
-      }
-      const sourceSessionId = yield* Ref.get(state.museSessionId);
+      return yield* withThreadLock(threadId, (state) =>
+        Effect.gen(function* () {
+          if (Option.isSome(yield* Ref.get(state.activeTurnId))) {
+            return yield* new ProviderAdapterValidationError({
+              provider: PROVIDER,
+              operation: "rollbackThread",
+              issue: "Cannot rewind while a Muse turn is running; interrupt it first.",
+            });
+          }
+          const sourceSessionId = yield* Ref.get(state.museSessionId);
 
-      // Ask the host for the authoritative history (not the in-memory cache,
-      // which is best-effort and may miss items from before this process
-      // attached) to find the ordered list of turns that actually exist.
-      const read = yield* state.client
-        .sessionRead({ sessionId: sourceSessionId, excludeItems: false })
-        .pipe(Effect.mapError(mapMspError(threadId, "session/read")));
-      const historyItems = decodeHistoryItems(read.history.items ?? []);
-      const turnIds = orderedTurnIds(historyItems);
-      if (turnIds.length < numTurns) {
-        return yield* new ProviderAdapterValidationError({
-          provider: PROVIDER,
-          operation: "rollbackThread",
-          issue: `Cannot rewind ${numTurns} turn(s): this Muse session only has ${turnIds.length}.`,
-        });
-      }
-      // The last turn to KEEP; undefined means "keep nothing" — but MSP's
-      // omitted `cutPoint` means "all completed turns", the opposite, so an
-      // empty result needs the earliest turn's predecessor, which doesn't
-      // exist. Rewinding the whole conversation is out of scope.
-      const keepThroughTurnId = turnIds[turnIds.length - numTurns - 1];
-      if (keepThroughTurnId === undefined) {
-        return yield* new ProviderAdapterValidationError({
-          provider: PROVIDER,
-          operation: "rollbackThread",
-          issue: "Muse cannot rewind past the first turn of a session; start a new thread instead.",
-        });
-      }
+          // Ask the host for the authoritative history (not the in-memory cache,
+          // which is best-effort and may miss items from before this process
+          // attached) to find the ordered list of turns that actually exist.
+          const read = yield* state.client
+            .sessionRead({ sessionId: sourceSessionId, excludeItems: false })
+            .pipe(Effect.mapError(mapMspError(threadId, "session/read")));
+          const historyItems = decodeHistoryItems(read.history.items ?? []);
+          const turnIds = orderedTurnIds(historyItems);
+          if (turnIds.length < numTurns) {
+            return yield* new ProviderAdapterValidationError({
+              provider: PROVIDER,
+              operation: "rollbackThread",
+              issue: `Cannot rewind ${numTurns} turn(s): this Muse session only has ${turnIds.length}.`,
+            });
+          }
+          // The last turn to KEEP. `undefined` means "keep nothing": MSP's omitted
+          // `cutPoint` means "all completed turns" (the opposite), so a rewind to
+          // an empty conversation is a fresh `session/start` in the same
+          // workspace instead of a fork. CheckpointReactor accepts turnCount=0
+          // and restores the filesystem before calling this, so refusing here
+          // would leave files reverted but the conversation intact.
+          const keepThroughTurnId = turnIds[turnIds.length - numTurns - 1];
+          const runtimeMode = yield* Ref.get(state.runtimeMode);
+          const approvalMode = runtimeModeToApprovalMode(runtimeMode);
+          const modelId = yield* Ref.get(state.modelId);
 
-      const commandId = yield* randomUuidV7;
-      const forked = yield* state.client
-        .sessionFork({
-          commandId,
-          sessionId: sourceSessionId,
-          cutPoint: { lastTurnId: keepThroughTurnId },
-          excludeItems: false,
-        })
-        .pipe(Effect.mapError(mapMspError(threadId, "session/fork")));
+          // Prepare the replacement session FULLY (create it, apply approval mode
+          // and model) before touching any local state. If any step fails or is
+          // interrupted the thread still targets the untouched source session,
+          // the caller gets an error, and a retry starts from the same place
+          // instead of compounding on a half-configured fork.
+          const replacement =
+            keepThroughTurnId === undefined
+              ? yield* state.client
+                  .sessionStart({
+                    commandId: yield* randomUuidV7,
+                    approvalMode,
+                    ...(state.cwd ? { workspaceRoot: state.cwd } : {}),
+                    ...(modelId ? { modelId } : {}),
+                  })
+                  .pipe(
+                    Effect.mapError(mapMspError(threadId, "session/start")),
+                    Effect.map((result) => ({
+                      sessionId: result.session.sessionId,
+                      viewCursor: result.viewCursor,
+                      items: [] as Array<MspSchema.Item>,
+                      // session/start already took approvalMode/modelId.
+                      needsSettings: false,
+                    })),
+                  )
+              : yield* state.client
+                  .sessionFork({
+                    commandId: yield* randomUuidV7,
+                    sessionId: sourceSessionId,
+                    cutPoint: { lastTurnId: keepThroughTurnId },
+                    excludeItems: false,
+                  })
+                  .pipe(
+                    Effect.mapError(mapMspError(threadId, "session/fork")),
+                    Effect.map((result) => ({
+                      sessionId: result.session.sessionId,
+                      viewCursor: result.viewCursor,
+                      items: decodeHistoryItems(result.history.items ?? []),
+                      needsSettings: true,
+                    })),
+                  );
+          if (replacement.needsSettings) {
+            yield* state.client
+              .sessionSetApprovalMode({
+                commandId: yield* randomUuidV7,
+                sessionId: replacement.sessionId,
+                mode: approvalMode,
+              })
+              .pipe(Effect.mapError(mapMspError(threadId, "session/setApprovalMode")));
+            if (modelId) {
+              yield* state.client
+                .sessionSetModel({
+                  commandId: yield* randomUuidV7,
+                  model: { modelId },
+                  sessionId: replacement.sessionId,
+                })
+                .pipe(Effect.mapError(mapMspError(threadId, "session/setModel")));
+            }
+          }
 
-      // Retarget every later call on this thread at the fork, and re-apply
-      // per-session settings the fork does not inherit from its source.
-      yield* Ref.set(state.museSessionId, forked.session.sessionId);
-      yield* Ref.set(state.viewCursor, forked.viewCursor);
-      yield* Ref.set(state.activeTurnId, Option.none());
-      yield* Ref.set(state.pendingApprovals, new Map());
-      yield* Ref.set(state.pendingUserInputs, new Map());
-      yield* Ref.set(state.pendingAnsweredUserInputs, new Map());
-      const forkItems = decodeHistoryItems(forked.history.items ?? []);
-      yield* Ref.set(state.items, forkItems);
-      yield* Ref.set(
-        state.itemKindByItemId,
-        new Map(forkItems.map((item) => [item.itemId, item.kind] as const)),
+          // Commit: retarget every later call on this thread at the replacement.
+          // All Ref writes, no yield points that can fail in between, inside
+          // `uninterruptible` so a cancellation cannot leave half the state
+          // pointing at the old session and half at the new one.
+          yield* Effect.uninterruptible(
+            Effect.gen(function* () {
+              yield* Ref.set(state.museSessionId, replacement.sessionId);
+              yield* Ref.set(state.viewCursor, replacement.viewCursor);
+              yield* Ref.set(state.activeTurnId, Option.none());
+              yield* Ref.set(state.pendingApprovals, new Map());
+              yield* Ref.set(state.pendingUserInputs, new Map());
+              yield* Ref.set(state.pendingAnsweredUserInputs, new Map());
+              yield* Ref.set(state.items, replacement.items);
+              yield* Ref.set(
+                state.itemKindByItemId,
+                new Map(replacement.items.map((item) => [item.itemId, item.kind] as const)),
+              );
+            }),
+          );
+
+          // ProviderService persists the new resume cursor right after this
+          // returns (via listSessions), so a restart before the next turn resumes
+          // the replacement, not the untrimmed source. This `session.started` is
+          // the runtime-event marker that the underlying session was replaced.
+          const base = yield* emitBase({ threadId });
+          yield* emit({
+            ...base,
+            type: "session.started",
+            payload: {
+              message:
+                keepThroughTurnId === undefined
+                  ? "Rewound to the start by replacing the Muse session."
+                  : `Rewound ${numTurns} turn(s) by forking the Muse session.`,
+              resume: {
+                schemaVersion: RESUME_CURSOR_VERSION,
+                museSessionId: replacement.sessionId,
+              },
+            },
+          } as ProviderRuntimeEvent);
+
+          return {
+            threadId,
+            turns: groupItemsByTurn(replacement.items),
+          } satisfies ProviderThreadSnapshot;
+        }),
       );
-      const approvalMode = runtimeModeToApprovalMode(yield* Ref.get(state.runtimeMode));
-      yield* state.client
-        .sessionSetApprovalMode({
-          commandId: yield* randomUuidV7,
-          sessionId: forked.session.sessionId,
-          mode: approvalMode,
-        })
-        .pipe(Effect.mapError(mapMspError(threadId, "session/setApprovalMode")));
-      const modelId = yield* Ref.get(state.modelId);
-      if (modelId) {
-        yield* state.client
-          .sessionSetModel({
-            commandId: yield* randomUuidV7,
-            model: { modelId },
-            sessionId: forked.session.sessionId,
-          })
-          .pipe(Effect.mapError(mapMspError(threadId, "session/setModel")));
-      }
-
-      // Persistence of the new resume cursor happens on the NEXT `sendTurn`
-      // (its `ProviderTurnStartResult.resumeCursor` is what ProviderService
-      // upserts), reading the Ref just retargeted above. Until then a
-      // server restart would resume the source session, i.e. the rewind is
-      // only durable once the user continues on the fork — the same
-      // "uncommitted until the next turn" semantics as the in-memory
-      // conversation state itself. This `session.started` is the
-      // informational marker that the underlying session was replaced.
-      const base = yield* emitBase({ threadId });
-      yield* emit({
-        ...base,
-        type: "session.started",
-        payload: {
-          message: `Rewound ${numTurns} turn(s) by forking the Muse session.`,
-          resume: {
-            schemaVersion: RESUME_CURSOR_VERSION,
-            museSessionId: forked.session.sessionId,
-          },
-        },
-      } as ProviderRuntimeEvent);
-
-      return { threadId, turns: groupItemsByTurn(forkItems) } satisfies ProviderThreadSnapshot;
     });
 
   const stopAll = (): Effect.Effect<void, ProviderAdapterError> =>
@@ -1415,37 +1473,38 @@ export const makeMuseAdapter = Effect.fn("makeMuseAdapter")(function* (
     compaction: {
       type: "native",
       start: (threadId) =>
-        Effect.gen(function* () {
-          const state = yield* requireThread(threadId);
-          const commandId = yield* randomUuidV7;
-          const sessionId = yield* Ref.get(state.museSessionId);
-          const result = yield* state.client
-            .sessionCompact({ commandId, sessionId })
-            .pipe(Effect.mapError(mapMspError(threadId, "session/compact")));
-          const base = yield* emitBase({ threadId });
-          // `ProviderService`/runtime ingestion complete a compaction request
-          // off the canonical `thread.state.changed(compacted)` event, not
-          // the item-lifecycle events Muse emits for the compaction item
-          // itself — without this, the request just times out. A rejected or
-          // skipped compaction (`result.reason` set) is surfaced instead of
-          // silently discarded.
-          if (result.reason) {
-            // ProviderService waits for the canonical compaction-completed
-            // event after `start` succeeds; a bare warning never settles
-            // that wait, leaving a skipped/rejected compaction pending for
-            // the full timeout. Fail instead so the request clears now.
-            return yield* new ProviderAdapterRequestError({
-              provider: PROVIDER,
-              method: "session/compact",
-              detail: `Muse did not compact this session: ${result.reason}`,
-            });
-          }
-          yield* emit({
-            ...base,
-            type: "thread.state.changed",
-            payload: { state: "compacted" },
-          } as ProviderRuntimeEvent);
-        }),
+        withThreadLock(threadId, (state) =>
+          Effect.gen(function* () {
+            const commandId = yield* randomUuidV7;
+            const sessionId = yield* Ref.get(state.museSessionId);
+            const result = yield* state.client
+              .sessionCompact({ commandId, sessionId })
+              .pipe(Effect.mapError(mapMspError(threadId, "session/compact")));
+            const base = yield* emitBase({ threadId });
+            // `ProviderService`/runtime ingestion complete a compaction request
+            // off the canonical `thread.state.changed(compacted)` event, not
+            // the item-lifecycle events Muse emits for the compaction item
+            // itself — without this, the request just times out. A rejected or
+            // skipped compaction (`result.reason` set) is surfaced instead of
+            // silently discarded.
+            if (result.reason) {
+              // ProviderService waits for the canonical compaction-completed
+              // event after `start` succeeds; a bare warning never settles
+              // that wait, leaving a skipped/rejected compaction pending for
+              // the full timeout. Fail instead so the request clears now.
+              return yield* new ProviderAdapterRequestError({
+                provider: PROVIDER,
+                method: "session/compact",
+                detail: `Muse did not compact this session: ${result.reason}`,
+              });
+            }
+            yield* emit({
+              ...base,
+              type: "thread.state.changed",
+              payload: { state: "compacted" },
+            } as ProviderRuntimeEvent);
+          }),
+        ),
     },
     startSession,
     sendTurn,

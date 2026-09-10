@@ -10,6 +10,7 @@
 import { type ModelSelection, type MuseSettings, TextGenerationError } from "@t3tools/contracts";
 import * as Effect from "effect/Effect";
 import * as FileSystem from "effect/FileSystem";
+import * as Path from "effect/Path";
 import * as Fiber from "effect/Fiber";
 import * as Deferred from "effect/Deferred";
 import * as Ref from "effect/Ref";
@@ -37,6 +38,21 @@ import {
 import { sanitizeBranchFragment, sanitizeFeatureBranchName } from "@t3tools/shared/git";
 
 const MUSE_TIMEOUT_MS = 180_000;
+
+/**
+ * A configured executable that only makes sense relative to some directory:
+ * `./bin/muse`, `../tools/muse`, `bin/muse`. Bare names (`muse`) are PATH
+ * lookups and absolute paths (`/opt/muse`, `C:\\muse.exe`) are already
+ * anchored, so neither is "relative" for this purpose.
+ */
+export const isRelativeExecutablePath = (command: string): boolean => {
+  if (command.length === 0) return false;
+  const hasSeparator = command.includes("/") || command.includes("\\");
+  if (!hasSeparator) return false;
+  const isPosixAbsolute = command.startsWith("/");
+  const isWindowsAbsolute = /^[A-Za-z]:[\\/]/.test(command) || command.startsWith("\\\\");
+  return !isPosixAbsolute && !isWindowsAbsolute;
+};
 const isTextGenerationError = Schema.is(TextGenerationError);
 type MuseTextGenerationOperation =
   | "generateCommitMessage"
@@ -50,22 +66,32 @@ export const makeMuseTextGeneration = Effect.fn("makeMuseTextGeneration")(functi
 ) {
   const spawner = yield* ChildProcessSpawner.ChildProcessSpawner;
   const fs = yield* FileSystem.FileSystem;
+  const path = yield* Path.Path;
 
   const runMuseJson = <S extends Schema.Top>({
     operation,
+    cwd,
     prompt,
     outputSchemaJson,
     modelSelection,
   }: {
     operation: MuseTextGenerationOperation;
-    /** Accepted for interface parity; the child never runs in it (see isolatedCwd). */
+    /** The repository. The child never runs in it (see isolatedCwd); it is only
+     * the base a relative `binaryPath` (e.g. `./bin/muse`) resolves against. */
     cwd: string;
     prompt: string;
     outputSchemaJson: S;
     modelSelection: ModelSelection;
   }): Effect.Effect<S["Type"], TextGenerationError, S["DecodingServices"]> =>
     Effect.gen(function* () {
-      const command = museSettings.binaryPath || "muse";
+      // A relative `binaryPath` was meaningful against the repository cwd the
+      // interactive adapter spawns in; anchor it there explicitly, because the
+      // child below runs in an empty temp dir where `./bin/muse` resolves to
+      // nothing. Bare names (`muse`) stay as-is for PATH lookup.
+      const configured = museSettings.binaryPath || "muse";
+      const command = isRelativeExecutablePath(configured)
+        ? path.resolve(cwd, configured)
+        : configured;
       // Process-level isolation, the strongest mitigation MSP v1 leaves open:
       // `muse serve` runs in an empty scoped temp dir, NOT the user's repo,
       // so even if a tool call slipped past `denyUnmatched` (below) it has

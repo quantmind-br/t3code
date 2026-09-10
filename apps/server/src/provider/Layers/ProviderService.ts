@@ -2117,6 +2117,28 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
         "provider.rollback_turns": input.numTurns,
       });
       yield* routed.adapter.rollbackThread(routed.threadId, input.numTurns);
+      // An adapter may implement rollback by moving the thread onto a
+      // different native session (Muse forks; there is no in-place rewind),
+      // which changes its resume cursor. Persist that now, before the
+      // checkpoint revert completes, or a restart before the next turn would
+      // resume the untrimmed source while T3 shows the reverted conversation.
+      const rolledBack = yield* routed.adapter
+        .listSessions()
+        .pipe(
+          Effect.map((sessions) =>
+            sessions.find((session) => session.threadId === routed.threadId),
+          ),
+        );
+      if (rolledBack !== undefined) {
+        yield* upsertSessionBinding(
+          { ...rolledBack, providerInstanceId: routed.instanceId },
+          routed.threadId,
+          {
+            lastRuntimeEvent: "provider.rollbackConversation",
+            lastRuntimeEventAt: yield* nowIso,
+          },
+        );
+      }
       yield* analytics.record("provider.conversation.rolled_back", {
         provider: routed.adapter.provider,
         turns: input.numTurns,
