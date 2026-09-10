@@ -87,12 +87,18 @@ export const MuseDriver: ProviderDriver<MuseSettings, MuseDriverEnv> = {
       });
       const effectiveConfig = { ...config, enabled } satisfies MuseSettings;
 
+      const serverConfig = yield* ServerConfig;
       const adapter = yield* makeMuseAdapter({
         binaryPath: effectiveConfig.binaryPath,
         customModels: effectiveConfig.customModels,
         environment: processEnv,
         instanceId,
-      }).pipe(Effect.provideService(ChildProcessSpawner.ChildProcessSpawner, spawner));
+        homePath: effectiveConfig.homePath,
+        attachmentsDir: serverConfig.attachmentsDir,
+      }).pipe(
+        Effect.provideService(ChildProcessSpawner.ChildProcessSpawner, spawner),
+        Effect.provideService(FileSystem.FileSystem, fileSystem),
+      );
 
       const textGeneration = yield* makeMuseTextGeneration(effectiveConfig, processEnv).pipe(
         Effect.provideService(ChildProcessSpawner.ChildProcessSpawner, spawner),

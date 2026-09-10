@@ -76,6 +76,13 @@ export interface MspClient {
   readonly sessionFork: (
     params: MspSchema.SessionForkParams,
   ) => Effect.Effect<MspSchema.SessionForkResult, MspError.MspError>;
+  /**
+   * Cursor-paged read of a session's view. Pages are ascending and
+   * contiguous, so this is what fills a `view/gap` hole.
+   */
+  readonly viewPage: (
+    params: MspSchema.ViewPageParams,
+  ) => Effect.Effect<MspSchema.ViewPageResult, MspError.MspError>;
   readonly sessionSetModel: (
     params: MspSchema.SessionSetModelParams,
   ) => Effect.Effect<MspSchema.SessionSetModelResult, MspError.MspError>;
@@ -159,6 +166,7 @@ export const makeOverStdio = Effect.fn("effect-msp/makeOverStdio")(function* (
     sessionResume: (params) => call("session/resume", MspSchema.SessionResumeResult, params),
     sessionRead: (params) => call("session/read", MspSchema.SessionReadResult, params),
     sessionFork: (params) => call("session/fork", MspSchema.SessionForkResult, params),
+    viewPage: (params) => call("view/page", MspSchema.ViewPageResult, params),
     sessionSetModel: (params) => call("session/setModel", MspSchema.SessionSetModelResult, params),
     sessionSetApprovalMode: (params) =>
       call("session/setApprovalMode", MspSchema.SessionSetApprovalModeResult, params),

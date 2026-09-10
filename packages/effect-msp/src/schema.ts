@@ -254,6 +254,35 @@ export type Session = typeof Session.Type;
  */
 export type Item = Record<string, unknown> & { readonly itemId: string; readonly kind: string };
 
+/**
+ * One `workflow` item's folded child state, keyed by `(childId, attempt)` and
+ * re-emitted whole on every change (the item `revision` is the ordering
+ * guard). Typed here rather than left open because the adapter projects each
+ * child onto its own runtime task row. `status` is durable runtime vocabulary
+ * (an open string), not the item status enum.
+ */
+export interface WorkflowChild {
+  readonly attempt: number;
+  readonly childId: string;
+  readonly durationMs?: number;
+  readonly label?: string;
+  readonly phase?: string;
+  readonly resultRef?: string;
+  readonly status: string;
+  readonly terminal?: string;
+  readonly usage?: TokenUsage;
+}
+
+/** Provider-reported token counts. MSP carries no total; consumers derive one. */
+export interface TokenUsage {
+  readonly cacheReadTokens?: number;
+  readonly cacheWriteTokens?: number;
+  readonly cachedTokens: number;
+  readonly inputTokens: number;
+  readonly outputTokens: number;
+  readonly reasoningTokens: number;
+}
+
 export const SessionHistory = Schema.Struct({
   items: Schema.NullOr(Schema.Array(Schema.Unknown)),
   mode: Schema.String,
@@ -519,8 +548,48 @@ export const UserInputSettledParams = Schema.Struct({
 });
 export type UserInputSettledParams = typeof UserInputSettledParams.Type;
 
+/**
+ * `view/gap` names a hole in push delivery: `after` is the last cursor
+ * delivered before it, `next` the first delivered after it. Both are exclusive
+ * bounds and both are opaque — relayed, never parsed.
+ */
 export const ViewGapParams = Schema.Struct({
-  after: Schema.optional(Schema.String),
-  sessionId: Schema.optional(Schema.String),
+  after: Schema.String,
+  next: Schema.String,
+  sessionId: Schema.String,
 });
 export type ViewGapParams = typeof ViewGapParams.Type & Record<string, unknown>;
+
+/**
+ * One element of a `view/page` result: the live notification minus its frame
+ * (`jsonrpc`, `emittedAtMs`), with nothing lifted out of `params`. Replaying
+ * one is therefore exactly equivalent to having received the live event.
+ */
+export const UnframedViewNotification = Schema.Struct({
+  method: Schema.String,
+  params: Schema.Record(Schema.String, Schema.Unknown),
+});
+export type UnframedViewNotification = typeof UnframedViewNotification.Type;
+
+export interface ViewPageParams {
+  /** Exclusive anchor. Forward: the page starts strictly after it. */
+  readonly cursor?: string;
+  /** Request-mode anchor, mutually exclusive with `cursor`. */
+  readonly anchor?: string;
+  /** `forward` when omitted. */
+  readonly direction?: "forward" | "backward";
+  /** 1–1000; the server may serve fewer. */
+  readonly limit: number;
+  readonly sessionId: string;
+}
+
+export const ViewPageResult = Schema.Struct({
+  events: Schema.Array(UnframedViewNotification),
+  nextCursor: Schema.NullOr(Schema.String),
+  resolvedAnchor: Schema.optional(Schema.Struct({ boundaryCursor: Schema.String })),
+});
+export type ViewPageResult = typeof ViewPageResult.Type;
+
+export interface ViewUnsubscribeParams {
+  readonly sessionId: string;
+}

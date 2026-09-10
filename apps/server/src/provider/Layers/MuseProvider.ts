@@ -25,6 +25,8 @@ import { ChildProcess, ChildProcessSpawner } from "effect/unstable/process";
 import { createModelCapabilities } from "@t3tools/shared/model";
 import { resolveSpawnCommand } from "@t3tools/shared/shell";
 
+import { makeMuseEnvironment } from "./MuseEnvironment.ts";
+
 import {
   buildServerProvider,
   isCommandMissingCause,
@@ -103,14 +105,16 @@ export const checkMuseProviderStatus = Effect.fn("checkMuseProviderStatus")(func
   }
 
   const command = museSettings.binaryPath || "muse";
+  // Probe the account this instance actually runs as, not the machine default.
+  const museEnvironment = makeMuseEnvironment(environment, museSettings.homePath);
   const versionResult = yield* resolveSpawnCommand(command, ["--version"], {
-    env: environment,
+    env: museEnvironment,
   }).pipe(
     Effect.flatMap((spawnCommand) =>
       spawnAndCollect(
         command,
         ChildProcess.make(spawnCommand.command, spawnCommand.args, {
-          env: { ...environment, MUSE_NO_AUTO_UPDATE: "1" },
+          env: { ...museEnvironment, MUSE_NO_AUTO_UPDATE: "1" },
           shell: spawnCommand.shell,
         }),
       ),

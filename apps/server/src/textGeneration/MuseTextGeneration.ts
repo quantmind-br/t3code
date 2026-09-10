@@ -20,6 +20,8 @@ import { ChildProcessSpawner } from "effect/unstable/process";
 import { extractJsonObject } from "@t3tools/shared/schemaJson";
 import { resolveSpawnCommand } from "@t3tools/shared/shell";
 
+import { makeMuseEnvironment } from "../provider/Layers/MuseEnvironment.ts";
+
 import * as MspClient from "effect-msp/client";
 import { randomUuidV7 } from "effect-msp/uuid";
 
@@ -67,6 +69,9 @@ export const makeMuseTextGeneration = Effect.fn("makeMuseTextGeneration")(functi
   const spawner = yield* ChildProcessSpawner.ChildProcessSpawner;
   const fs = yield* FileSystem.FileSystem;
   const path = yield* Path.Path;
+  // Text generation runs against the same Muse account as the rest of this
+  // instance, so it must not silently fall back to the machine default.
+  const museEnvironment = makeMuseEnvironment(environment, museSettings.homePath);
 
   const runMuseJson = <S extends Schema.Top>({
     operation,
@@ -114,7 +119,7 @@ export const makeMuseTextGeneration = Effect.fn("makeMuseTextGeneration")(functi
       // workspace plus `approvalMode: "denyUnmatched"` below, this is the
       // tightest combination MSP v1 exposes for a one-shot generation session.
       const spawnCommand = yield* resolveSpawnCommand(command, ["serve"], {
-        env: environment,
+        env: museEnvironment,
         extendEnv: true,
       }).pipe(
         Effect.mapError(
@@ -130,7 +135,7 @@ export const makeMuseTextGeneration = Effect.fn("makeMuseTextGeneration")(functi
       const client = yield* MspClient.spawn({
         command: spawnCommand.command,
         args: spawnCommand.args,
-        env: environment,
+        env: museEnvironment,
         cwd: isolatedCwd,
         shell: spawnCommand.shell,
       }).pipe(

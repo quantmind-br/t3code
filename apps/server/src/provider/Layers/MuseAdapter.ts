@@ -14,16 +14,30 @@
  * conversation continuity, and this adapter never resends prior turns to
  * fake continuation.
  *
- * Deliberately out of scope for this pass (tracked as follow-ups, not
- * silently dropped): image/file attachments (turn input is text-only for
- * now — attachments produce a `runtime.warning` event instead of being
- * silently ignored), subagent/workflow items beyond a generic fallback
- * rendering, `view/gap` recovery (a dropped-notification bracket surfaces
- * as a `runtime.warning` today rather than a splice-fill), and
- * `readThread`, which serves this adapter's own in-memory item cache
- * (seeded from resume history, then live notifications) grouped by turn
- * rather than a fresh `session/read` query — sufficient for feedback upload
- * and diagnostics, not a substitute for the native session log.
+ * Attachments: images ride the turn as native MSP `image` input parts
+ * (base64 + `mediaType`); files and unknown types reach the model through the
+ * on-disk path line `ProviderService` appends to the prompt, which is also
+ * MSP's own mechanism for file mentions.
+ *
+ * Subagent and workflow items are not rendered as generic tool calls: they
+ * map to `collab_agent_tool_call` and are additionally projected onto the
+ * task lifecycle (`task.started`/`task.progress`/`task.completed`) with real
+ * agent identity, role, model, phases and usage. A workflow's folded
+ * `children` each become their own task row parented to the workflow — see
+ * `emitAgentTaskEvents`.
+ *
+ * A `view/gap` bracket is recovered by splice-fill through `view/page`, MSP's
+ * own sanctioned recovery — see `fillViewGap`.
+ *
+ * Per-instance account isolation is driven by the `homePath` setting, which
+ * pins `XDG_CONFIG_HOME`/`XDG_DATA_HOME`/`MUSE_AUTH_PATH` for every process
+ * this adapter spawns — see `MuseEnvironment`.
+ *
+ * Deliberately out of scope for this pass (tracked as a follow-up, not
+ * silently dropped): `readThread`, which serves this adapter's own in-memory
+ * item cache (seeded from resume history, then live notifications) grouped by
+ * turn rather than a fresh `session/read` query — sufficient for feedback
+ * upload and diagnostics, not a substitute for the native session log.
  * Conversation rollback IS supported, via `session/fork` — see
  * `rollbackThread` for the exact semantics and its one limit (cannot rewind
  * past the first turn).
@@ -45,6 +59,9 @@ import {
   type ProviderUserInputAnswers,
   RuntimeItemId,
   RuntimeRequestId,
+  RuntimeTaskId,
+  type RuntimeTaskStatus,
+  type RuntimeTaskUsage,
   ThreadId,
   type ProviderTurnStartResult,
   TurnId,
@@ -57,6 +74,7 @@ import * as Option from "effect/Option";
 import * as PubSub from "effect/PubSub";
 import * as Ref from "effect/Ref";
 import * as Schema from "effect/Schema";
+import * as FileSystem from "effect/FileSystem";
 import * as Scope from "effect/Scope";
 import * as Semaphore from "effect/Semaphore";
 import * as Stream from "effect/Stream";
@@ -77,9 +95,20 @@ import {
 } from "../Errors.ts";
 import type { ProviderAdapterError } from "../Errors.ts";
 import type { ProviderAdapterShape, ProviderThreadSnapshot } from "../Services/ProviderAdapter.ts";
+import { resolveAttachmentPath } from "../../attachmentStore.ts";
+import { makeMuseEnvironment } from "./MuseEnvironment.ts";
 
 const PROVIDER = ProviderDriverKind.make("muse");
 const RESUME_CURSOR_VERSION = 1 as const;
+
+/**
+ * `view/gap` splice-fill budget. MSP caps `view/page` at 1000 events per call;
+ * 200 keeps one recovery request small enough not to stall the notification
+ * consumer (the fill runs on it), and 25 pages bounds a pathological gap at
+ * 5,000 recovered events before the adapter gives up and says so.
+ */
+const VIEW_GAP_PAGE_LIMIT = 200;
+const VIEW_GAP_MAX_PAGES = 25;
 
 interface MuseResumeCursor {
   readonly schemaVersion: typeof RESUME_CURSOR_VERSION;
@@ -147,6 +176,13 @@ interface MuseThreadState {
   /** Best-effort item cache for `readThread`; not the native session log. */
   readonly items: Ref.Ref<Array<MspSchema.Item>>;
   readonly itemKindByItemId: Ref.Ref<Map<string, string>>;
+  /** Task rows this thread already opened, so a re-emitted item revision (or a
+   * `view/gap` fill that replays an item the live stream already delivered)
+   * updates the row instead of opening a second one. */
+  readonly emittedTaskIds: Ref.Ref<Set<string>>;
+  /** Task rows already closed, so a terminal item re-emitted at a higher
+   * revision does not report a second completion. */
+  readonly completedTaskIds: Ref.Ref<Set<string>>;
   readonly createdAt: string;
   readonly runtimeMode: Ref.Ref<RuntimeMode>;
   readonly modelId: Ref.Ref<string | undefined>;
@@ -221,9 +257,13 @@ const canonicalItemType = (item: MspSchema.Item): string => {
       return "context_compaction";
     case "userShell":
       return "command_execution";
-    case "toolCall":
     case "subagent":
     case "workflow":
+      // Agent-delegation work, not an ordinary tool call: this is what puts
+      // these items in the Agents surface and the work log's agent-tool lane
+      // instead of rendering them as a generic tool row.
+      return "collab_agent_tool_call";
+    case "toolCall":
     case "reminderChild":
       return "dynamic_tool_call";
     default:
@@ -234,8 +274,156 @@ const canonicalItemType = (item: MspSchema.Item): string => {
 const itemTitle = (item: MspSchema.Item): string | undefined => {
   if (typeof item.toolName === "string") return item.toolName;
   if (typeof item.commandText === "string") return item.commandText;
+  // Delegated work is identified by what it was asked to do, not by a tool
+  // name it does not have.
+  if (item.kind === "subagent") {
+    if (typeof item.objective === "string" && item.objective.trim()) return item.objective.trim();
+    if (typeof item.role === "string" && item.role.trim()) return item.role.trim();
+    if (typeof item.agentPath === "string" && item.agentPath.trim()) return item.agentPath.trim();
+  }
+  if (item.kind === "workflow") {
+    if (typeof item.entryId === "string" && item.entryId.trim()) return item.entryId.trim();
+    if (typeof item.scriptId === "string" && item.scriptId.trim()) return item.scriptId.trim();
+  }
   return undefined;
 };
+
+/** Trimmed non-empty string, or `undefined` — the shape every optional runtime field wants. */
+const optionalText = (value: unknown): string | undefined => {
+  if (typeof value !== "string") return undefined;
+  const trimmed = value.trim();
+  return trimmed.length > 0 ? trimmed : undefined;
+};
+
+const optionalNonNegativeInt = (value: unknown): number | undefined =>
+  typeof value === "number" && Number.isInteger(value) && value >= 0 ? value : undefined;
+
+/**
+ * MSP `TokenUsage` -> `RuntimeTaskUsage`. MSP reports input/output/cached/
+ * reasoning separately and has no total, so the total is derived; the cache
+ * read/write split collapses into `cachedInputTokens` because the runtime
+ * contract only models one cached bucket.
+ */
+const toRuntimeTaskUsage = (usage: unknown, durationMs?: unknown): RuntimeTaskUsage | undefined => {
+  if (typeof usage !== "object" || usage === null) {
+    const onlyDuration = optionalNonNegativeInt(durationMs);
+    return onlyDuration === undefined ? undefined : { totalTokens: 0, durationMs: onlyDuration };
+  }
+  const record = usage as Record<string, unknown>;
+  const inputTokens = optionalNonNegativeInt(record.inputTokens);
+  const outputTokens = optionalNonNegativeInt(record.outputTokens);
+  const cachedInputTokens = optionalNonNegativeInt(record.cachedTokens);
+  const reasoningOutputTokens = optionalNonNegativeInt(record.reasoningTokens);
+  const duration = optionalNonNegativeInt(durationMs);
+  return {
+    totalTokens: (inputTokens ?? 0) + (outputTokens ?? 0),
+    ...(inputTokens !== undefined ? { inputTokens } : {}),
+    ...(outputTokens !== undefined ? { outputTokens } : {}),
+    ...(cachedInputTokens !== undefined ? { cachedInputTokens } : {}),
+    ...(reasoningOutputTokens !== undefined ? { reasoningOutputTokens } : {}),
+    ...(duration !== undefined ? { durationMs: duration } : {}),
+  };
+};
+
+/**
+ * MSP `ItemStatus` (open enum, terminal = anything but `inProgress`) plus the
+ * `subagent`-only `controlStatus` lane, mapped onto the runtime task
+ * vocabulary. Unknown values are treated as terminal-unknown per MSP's
+ * rendering rule, which on this side means `failed` rather than a lie about
+ * success.
+ */
+const MSP_ITEM_STATUS_TO_TASK_STATUS: Record<string, RuntimeTaskStatus> = {
+  inProgress: "running",
+  completed: "completed",
+  failed: "failed",
+  cancelled: "cancelled",
+  rejected: "failed",
+  timedOut: "failed",
+};
+
+const MSP_CONTROL_STATUS_TO_TASK_STATUS: Record<string, RuntimeTaskStatus> = {
+  accepted: "pending",
+  starting: "pending",
+  running: "running",
+  resultReady: "running",
+  closing: "running",
+  closed: "completed",
+  recoveryPending: "waiting",
+  manualReconciliation: "waiting",
+};
+
+const taskStatusForItem = (item: MspSchema.Item): RuntimeTaskStatus => {
+  const status = typeof item.status === "string" ? item.status : "";
+  // `status` is the generic item vocabulary and wins whenever it is terminal;
+  // `controlStatus` only refines the still-open subagent lifecycle.
+  if (status !== "" && status !== "inProgress") {
+    return MSP_ITEM_STATUS_TO_TASK_STATUS[status] ?? "failed";
+  }
+  const control = typeof item.controlStatus === "string" ? item.controlStatus : undefined;
+  if (control) return MSP_CONTROL_STATUS_TO_TASK_STATUS[control] ?? "running";
+  return MSP_ITEM_STATUS_TO_TASK_STATUS[status] ?? "running";
+};
+
+/** Terminal task statuses collapse to the three the completed payload allows. */
+const toCompletedStatus = (status: RuntimeTaskStatus): "completed" | "failed" | "stopped" => {
+  if (status === "completed") return "completed";
+  if (status === "cancelled" || status === "interrupted") return "stopped";
+  return "failed";
+};
+
+/**
+ * The workflow's phase list, in first-appearance order over its children. MSP
+ * carries a phase name per child and no ordered phase table, so the order the
+ * children were folded in is the only ordering signal available.
+ */
+const workflowPhases = (
+  children: ReadonlyArray<MspSchema.WorkflowChild>,
+): Array<{ readonly index: number; readonly title: string }> => {
+  const seen = new Set<string>();
+  const phases: Array<{ readonly index: number; readonly title: string }> = [];
+  for (const child of children) {
+    const title = optionalText(child.phase);
+    if (title === undefined || seen.has(title)) continue;
+    seen.add(title);
+    phases.push({ index: phases.length, title });
+  }
+  return phases;
+};
+
+/** MSP `WorkflowChild.status` is camelCased durable runtime vocabulary, not the item enum. */
+const MSP_WORKFLOW_CHILD_STATUS_TO_TASK_STATUS: Record<string, RuntimeTaskStatus> = {
+  pending: "pending",
+  queued: "pending",
+  scheduled: "pending",
+  starting: "pending",
+  running: "running",
+  waiting: "waiting",
+  paused: "idle",
+  completed: "completed",
+  succeeded: "completed",
+  failed: "failed",
+  cancelled: "cancelled",
+  skipped: "cancelled",
+};
+
+const workflowChildStatus = (child: MspSchema.WorkflowChild): RuntimeTaskStatus => {
+  // `terminal` uses the turn vocabulary and is authoritative once present.
+  const terminal = optionalText(child.terminal);
+  if (terminal === "completed") return "completed";
+  if (terminal === "cancelled") return "cancelled";
+  if (terminal === "failed") return "failed";
+  if (terminal !== undefined) return "failed";
+  const status = optionalText(child.status);
+  if (status === undefined) return "running";
+  return MSP_WORKFLOW_CHILD_STATUS_TO_TASK_STATUS[status] ?? "running";
+};
+
+const TERMINAL_TASK_STATUSES: ReadonlySet<RuntimeTaskStatus> = new Set([
+  "completed",
+  "failed",
+  "cancelled",
+  "interrupted",
+]);
 
 const itemDetail = (item: MspSchema.Item): string | undefined =>
   typeof item.fallbackText === "string" ? item.fallbackText : undefined;
@@ -288,6 +476,10 @@ export interface MuseAdapterOptions {
   readonly customModels: MuseSettings["customModels"];
   readonly environment: NodeJS.ProcessEnv;
   readonly instanceId: ProviderInstanceId;
+  /** Per-instance Muse profile root; see `MuseEnvironment`. Empty shares the default account. */
+  readonly homePath: string | undefined;
+  /** Where `ProviderService` stores uploaded attachments, read when sending image parts. */
+  readonly attachmentsDir: string;
 }
 
 export const makeMuseAdapter = Effect.fn("makeMuseAdapter")(function* (
@@ -295,8 +487,12 @@ export const makeMuseAdapter = Effect.fn("makeMuseAdapter")(function* (
 ): Effect.fn.Return<
   ProviderAdapterShape<ProviderAdapterError>,
   never,
-  ChildProcessSpawner.ChildProcessSpawner
+  ChildProcessSpawner.ChildProcessSpawner | FileSystem.FileSystem
 > {
+  const fileSystem = yield* FileSystem.FileSystem;
+  // One environment for every child this adapter spawns, so all of them agree
+  // on which Muse account and session store this instance owns.
+  const environment = makeMuseEnvironment(options.environment, options.homePath);
   const spawner = yield* ChildProcessSpawner.ChildProcessSpawner;
   const threads = yield* Ref.make(new Map<ThreadId, MuseThreadState>());
   const runtimeEvents = yield* PubSub.unbounded<ProviderRuntimeEvent>();
@@ -346,6 +542,273 @@ export const makeMuseAdapter = Effect.fn("makeMuseAdapter")(function* (
       cause,
     });
   };
+
+  /**
+   * Reads one uploaded image attachment off disk and turns it into an MSP
+   * `image` input part. MSP takes base64 inline (there is no upload handle),
+   * and `mediaType` is required on an image part.
+   */
+  const readImageInputPart = (
+    threadId: ThreadId,
+    attachment: NonNullable<ProviderSendTurnInput["attachments"]>[number],
+  ): Effect.Effect<MspSchema.TurnInputPart, ProviderAdapterError> =>
+    Effect.gen(function* () {
+      const attachmentPath = resolveAttachmentPath({
+        attachmentsDir: options.attachmentsDir,
+        attachment,
+      });
+      if (!attachmentPath) {
+        return yield* new ProviderAdapterRequestError({
+          provider: PROVIDER,
+          method: "turn/start",
+          detail: `Invalid attachment id '${attachment.id}'.`,
+        });
+      }
+      const bytes = yield* fileSystem.readFile(attachmentPath).pipe(
+        Effect.mapError(
+          (cause) =>
+            new ProviderAdapterRequestError({
+              provider: PROVIDER,
+              method: "turn/start",
+              detail: `Failed to read attachment file: ${cause.message}.`,
+              cause,
+            }),
+        ),
+      );
+      return {
+        type: "image" as const,
+        base64Data: Buffer.from(bytes).toString("base64"),
+        mediaType: attachment.mimeType,
+      } satisfies MspSchema.TurnInputPart;
+    }).pipe(Effect.withSpan("MuseAdapter.readImageInputPart", { attributes: { threadId } }));
+
+  /**
+   * Projects a `subagent` or `workflow` item onto the task lifecycle.
+   *
+   * MSP has no task protocol: delegated work is only ever visible as transcript
+   * items whose whole state is re-emitted at a higher revision. So the mapping
+   * is idempotent-by-construction — `task.started` fires once per item id, and
+   * every later revision is a `task.progress` (with the folded status) plus a
+   * `task.completed` on the terminal revision. `emittedTaskIds` is what keeps
+   * a re-emitted item from opening a second row, including after a `view/gap`
+   * fill replays an item the live stream already delivered.
+   *
+   * A `workflow` item additionally carries its children folded whole; each one
+   * becomes its own task row parented to the workflow, which is the only way
+   * per-child phase/attempt/usage survives into the Agents surface.
+   */
+  const emitAgentTaskEvents = (
+    state: MuseThreadState,
+    item: MspSchema.Item,
+    method: "item/started" | "item/updated" | "item/completed",
+    activeTurnId: Option.Option<TurnId>,
+  ): Effect.Effect<void> =>
+    Effect.gen(function* () {
+      if (item.kind !== "subagent" && item.kind !== "workflow") return;
+
+      const turnFields = Option.isSome(activeTurnId) ? { turnId: activeTurnId.value } : {};
+      const emitTask = (event: Record<string, unknown>) =>
+        Effect.gen(function* () {
+          const base = yield* emitBase({ threadId: state.threadId });
+          yield* emit({ ...base, ...turnFields, ...event } as ProviderRuntimeEvent);
+        });
+
+      const isWorkflow = item.kind === "workflow";
+      const children = Array.isArray(item.children)
+        ? (item.children as ReadonlyArray<MspSchema.WorkflowChild>)
+        : [];
+      const phases = isWorkflow ? workflowPhases(children) : [];
+      const description =
+        itemTitle(item) ??
+        optionalText(item.fallbackText) ??
+        (isWorkflow ? "Workflow" : "Subagent");
+      const workflowRunId = optionalText(item.workflowRunId);
+      const childSessionLogPath = optionalText(item.childSessionLogPath);
+      const scriptId = optionalText(item.scriptId);
+      const runHandles = {
+        ...(workflowRunId ? { runId: workflowRunId } : {}),
+        ...(scriptId ? { scriptPath: scriptId } : {}),
+        ...(childSessionLogPath ? { transcriptDir: childSessionLogPath } : {}),
+      };
+      // `childSessionId` is the drill-down handle into the child's own
+      // transcript (`session/read`/`view/page`); surfacing it as the agent id
+      // is what lets a client ask for that transcript later.
+      const agentId = optionalText(item.subagentId) ?? optionalText(item.childSessionId);
+      const linkage = {
+        taskType: isWorkflow ? "local_workflow" : "subagent",
+        agentKind: "agent" as const,
+        ...(agentId ? { agentId } : {}),
+        title: description,
+        ...(optionalText(item.role) ? { role: optionalText(item.role) } : {}),
+        ...(optionalText(item.agentPath) ? { agentPath: optionalText(item.agentPath) } : {}),
+        ...(isWorkflow && (optionalText(item.entryId) ?? scriptId)
+          ? { workflowName: optionalText(item.entryId) ?? scriptId }
+          : {}),
+        ...(phases.length > 0 ? { phases } : {}),
+        ...(Object.keys(runHandles).length > 0 ? { runHandles } : {}),
+        ...(childSessionLogPath ? { outputFile: childSessionLogPath } : {}),
+        ...(optionalNonNegativeInt(item.depth) !== undefined
+          ? { agentIndex: optionalNonNegativeInt(item.depth) }
+          : {}),
+      };
+
+      const taskId = RuntimeTaskId.make(item.itemId);
+      const status = taskStatusForItem(item);
+      const usage = toRuntimeTaskUsage(item.usage, item.durationMs);
+      const failure = optionalText(item.failureReason);
+      const summary = optionalText(item.message) ?? optionalText(item.fallbackText);
+
+      const alreadyStarted = yield* Ref.modify(state.emittedTaskIds, (current) => {
+        if (current.has(item.itemId)) return [true, current] as const;
+        const next = new Set(current);
+        next.add(item.itemId);
+        return [false, next] as const;
+      });
+
+      if (!alreadyStarted) {
+        yield* emitTask({
+          type: "task.started",
+          payload: { taskId, description, ...linkage },
+        });
+      }
+
+      const terminal = method === "item/completed" || TERMINAL_TASK_STATUSES.has(status);
+      if (!terminal) {
+        yield* emitTask({
+          type: "task.progress",
+          payload: {
+            taskId,
+            description,
+            status,
+            ...(summary ? { summary } : {}),
+            ...(usage ? { typedUsage: usage } : {}),
+            ...(failure ? { error: failure } : {}),
+            ...linkage,
+          },
+        });
+      }
+
+      // Children first: a client folding the workflow's terminal row should
+      // already have every child's final state in hand.
+      yield* Effect.forEach(
+        children,
+        (child) => emitWorkflowChildEvents(state, item, child, turnFields, phases),
+        { concurrency: 1, discard: true },
+      );
+
+      if (terminal) {
+        const closed = yield* Ref.modify(state.completedTaskIds, (current) => {
+          if (current.has(item.itemId)) return [true, current] as const;
+          const next = new Set(current);
+          next.add(item.itemId);
+          return [false, next] as const;
+        });
+        if (closed) return;
+        yield* emitTask({
+          type: "task.completed",
+          payload: {
+            taskId,
+            status: toCompletedStatus(status),
+            ...((summary ?? failure) ? { summary: summary ?? failure } : {}),
+            ...(usage ? { typedUsage: usage } : {}),
+            ...linkage,
+          },
+        });
+      }
+    });
+
+  /**
+   * One workflow child as its own task row. The `(childId, attempt)` pair is
+   * the child's identity in MSP, so it is also the task id — a retried child
+   * is a distinct row rather than a mutated one.
+   */
+  const emitWorkflowChildEvents = (
+    state: MuseThreadState,
+    parent: MspSchema.Item,
+    child: MspSchema.WorkflowChild,
+    turnFields: { readonly turnId?: TurnId },
+    phases: ReadonlyArray<{ readonly index: number; readonly title: string }>,
+  ): Effect.Effect<void> =>
+    Effect.gen(function* () {
+      const childKey = `${parent.itemId}:${child.childId}:${child.attempt}`;
+      const taskId = RuntimeTaskId.make(childKey);
+      const description = optionalText(child.label) ?? child.childId;
+      const phaseTitle = optionalText(child.phase);
+      const phaseIndex = phaseTitle
+        ? phases.find((phase) => phase.title === phaseTitle)?.index
+        : undefined;
+      const linkage = {
+        taskType: "local_workflow_child",
+        agentKind: "agent" as const,
+        agentId: childKey,
+        parentAgentId:
+          optionalText(parent.subagentId) ?? optionalText(parent.childSessionId) ?? parent.itemId,
+        title: description,
+        ...((optionalText(parent.entryId) ?? optionalText(parent.scriptId))
+          ? { workflowName: optionalText(parent.entryId) ?? optionalText(parent.scriptId) }
+          : {}),
+        ...(phaseTitle ? { phaseTitle } : {}),
+        ...(phaseIndex !== undefined ? { phaseIndex } : {}),
+        ...(optionalNonNegativeInt(child.attempt) !== undefined
+          ? { attempt: optionalNonNegativeInt(child.attempt) }
+          : {}),
+        ...(phases.length > 0 ? { phases } : {}),
+      };
+
+      const emitTask = (event: Record<string, unknown>) =>
+        Effect.gen(function* () {
+          const base = yield* emitBase({ threadId: state.threadId });
+          yield* emit({ ...base, ...turnFields, ...event } as ProviderRuntimeEvent);
+        });
+
+      const status = workflowChildStatus(child);
+      const usage = toRuntimeTaskUsage(child.usage, child.durationMs);
+
+      const alreadyStarted = yield* Ref.modify(state.emittedTaskIds, (current) => {
+        if (current.has(childKey)) return [true, current] as const;
+        const next = new Set(current);
+        next.add(childKey);
+        return [false, next] as const;
+      });
+      if (!alreadyStarted) {
+        yield* emitTask({
+          type: "task.started",
+          payload: { taskId, description, ...linkage },
+        });
+      }
+
+      if (!TERMINAL_TASK_STATUSES.has(status)) {
+        yield* emitTask({
+          type: "task.progress",
+          payload: {
+            taskId,
+            description,
+            status,
+            ...(usage ? { typedUsage: usage } : {}),
+            ...linkage,
+          },
+        });
+        return;
+      }
+
+      const closed = yield* Ref.modify(state.completedTaskIds, (current) => {
+        if (current.has(childKey)) return [true, current] as const;
+        const next = new Set(current);
+        next.add(childKey);
+        return [false, next] as const;
+      });
+      if (closed) return;
+      yield* emitTask({
+        type: "task.completed",
+        payload: {
+          taskId,
+          status: toCompletedStatus(status),
+          ...(optionalText(child.resultRef) ? { summary: optionalText(child.resultRef) } : {}),
+          ...(usage ? { typedUsage: usage } : {}),
+          ...linkage,
+        },
+      });
+    });
 
   /** Consumes one host's notification stream for the lifetime of its scope. */
   const attachNotificationConsumer = (state: MuseThreadState) =>
@@ -478,6 +941,11 @@ export const makeMuseAdapter = Effect.fn("makeMuseAdapter")(function* (
               ...(itemDetail(item) ? { detail: itemDetail(item) } : {}),
             },
           } as ProviderRuntimeEvent);
+          // Subagent/workflow items are delegated agent work, not tool rows:
+          // mirror them onto the task lifecycle so they land in the Agents
+          // surface with real identity, role, model and usage instead of only
+          // an opaque timeline entry.
+          yield* emitAgentTaskEvents(state, item, notification.method, activeTurnId);
           return;
         }
         case "item/delta": {
@@ -688,23 +1156,156 @@ export const makeMuseAdapter = Effect.fn("makeMuseAdapter")(function* (
           return;
         }
         case "view/gap": {
-          yield* emit({
-            ...base,
-            type: "runtime.warning",
-            payload: {
-              message:
-                "Muse dropped one or more notifications on this connection (view/gap); some activity may be missing until the next turn.",
-            },
-          } as ProviderRuntimeEvent);
+          const params = yield* decode(MspSchema.ViewGapParams);
+          if (Option.isNone(params)) return;
+          yield* fillViewGap(state, params.value);
           return;
         }
         default:
           // Unmapped MSP notification (session/branchChanged, session/goalChanged,
           // session/todoListChanged, session/tokenUsage, session/contextUsage,
-          // turn/retracted, turn/retryScheduled, turn/unqueued, session/*Changed,
-          // subagent/* — deferred; not silently misrepresented as something else).
+          // turn/retracted, turn/retryScheduled, turn/unqueued, session/*Changed
+          // — deferred; not silently misrepresented as something else).
+          // Note there is no `subagent/*` notification in MSP v1: delegated
+          // work is observable only as `subagent`/`workflow` transcript items,
+          // which the item lifecycle above already projects onto tasks.
           return;
       }
+    });
+
+  /**
+   * Splice-fill recovery for `view/gap` (MSP's D-030 / FR-013 sanctioned
+   * recovery, the first of the two options).
+   *
+   * `view/gap` names a hole as the exclusive bracket `(after, next)`. The fill
+   * pages that bracket forward through `view/page` and replays each recovered
+   * event through the ordinary notification dispatch, so a recovered
+   * `item/completed` produces exactly the same runtime events a live one
+   * would.
+   *
+   * The "buffer live events at cursors >= next" half of the sanctioned recipe
+   * needs no buffer here: the notification consumer is a single sequential
+   * fiber draining an unbounded queue, so everything the host pushes while
+   * this fill runs simply waits its turn behind us and is applied after the
+   * spliced range. Overlap is discarded by paging exclusively — the event
+   * whose cursor equals `next` was already delivered live and stops the walk
+   * without being replayed.
+   *
+   * Two things are deliberately preserved across the fill:
+   *   - `state.viewCursor` is restored afterwards. Replayed events carry older
+   *     cursors, and letting them win would rewind the cursor this adapter
+   *     persists as its resume position.
+   *   - `item/started` for an item this thread already knows is replayed as
+   *     `item/updated`. `next` may name an ephemeral-sourced event (an
+   *     `item/delta`) that `view/page` never serves, in which case the walk
+   *     runs to the end of the page budget and can re-cover ground the live
+   *     stream already delivered; re-opening a known item would be the one
+   *     visible lie in that case.
+   */
+  const fillViewGap = (state: MuseThreadState, gap: MspSchema.ViewGapParams): Effect.Effect<void> =>
+    Effect.gen(function* () {
+      const liveCursor = yield* Ref.get(state.viewCursor);
+      const museSessionId = yield* Ref.get(state.museSessionId);
+      // `view/gap` carries the session it belongs to; a gap for some other
+      // session on this connection is not ours to fill.
+      const sessionId = gap.sessionId || museSessionId;
+
+      let cursor: string | undefined = gap.after;
+      let pages = 0;
+      let recovered = 0;
+      let reachedNext = false;
+      let failure: string | undefined;
+
+      while (pages < VIEW_GAP_MAX_PAGES && !reachedNext) {
+        // Annotated because the fill is mutually recursive with the live
+        // dispatch (`replayGapEvent` -> `handleNotification` -> `fillViewGap`),
+        // which leaves TypeScript no non-circular inference path here.
+        const page: Option.Option<MspSchema.ViewPageResult> = yield* state.client
+          .viewPage({
+            sessionId,
+            ...(cursor === undefined ? {} : { cursor }),
+            direction: "forward",
+            limit: VIEW_GAP_PAGE_LIMIT,
+          })
+          .pipe(
+            Effect.matchEffect({
+              onFailure: (error) =>
+                Effect.sync(() => {
+                  failure = error.message;
+                  return Option.none<MspSchema.ViewPageResult>();
+                }),
+              onSuccess: (result) =>
+                Effect.succeed(Option.some(result) as Option.Option<MspSchema.ViewPageResult>),
+            }),
+          );
+        if (Option.isNone(page)) break;
+        pages += 1;
+
+        for (const event of page.value.events) {
+          const eventCursor =
+            typeof event.params.viewCursor === "string" ? event.params.viewCursor : undefined;
+          // Exclusive upper bound: `next` itself arrived live.
+          if (eventCursor !== undefined && eventCursor === gap.next) {
+            reachedNext = true;
+            break;
+          }
+          yield* replayGapEvent(state, event);
+          recovered += 1;
+        }
+
+        if (reachedNext) break;
+        const nextCursor: string | null = page.value.nextCursor;
+        if (nextCursor === null) break;
+        cursor = nextCursor;
+      }
+
+      // Restore the live position; the replay walked backwards through
+      // already-superseded cursors.
+      yield* Ref.set(state.viewCursor, liveCursor);
+
+      if (failure !== undefined) {
+        const base = yield* emitBase({ threadId: state.threadId });
+        yield* emit({
+          ...base,
+          type: "runtime.warning",
+          payload: {
+            message: `Muse dropped notifications (view/gap) and the gap could not be fully recovered: ${failure}. ${recovered} event(s) were recovered; some activity may be missing until the next turn.`,
+          },
+        } as ProviderRuntimeEvent);
+        return;
+      }
+      if (!reachedNext && pages >= VIEW_GAP_MAX_PAGES) {
+        const base = yield* emitBase({ threadId: state.threadId });
+        yield* emit({
+          ...base,
+          type: "runtime.warning",
+          payload: {
+            message: `Muse dropped notifications (view/gap); ${recovered} event(s) were recovered before the recovery budget ran out, so some activity may still be missing.`,
+          },
+        } as ProviderRuntimeEvent);
+      }
+    });
+
+  /**
+   * Replays one recovered `view/page` event through the live dispatch. The
+   * only rewrite is `item/started` -> `item/updated` for an item this thread
+   * already knows about, so a re-covered range updates rather than re-opens.
+   */
+  const replayGapEvent = (
+    state: MuseThreadState,
+    event: MspSchema.UnframedViewNotification,
+  ): Effect.Effect<void> =>
+    Effect.gen(function* () {
+      let method = event.method;
+      if (method === "item/started") {
+        const params = event.params as { readonly item?: { readonly itemId?: unknown } };
+        const itemId = params.item?.itemId;
+        if (typeof itemId === "string") {
+          const known = yield* Ref.get(state.itemKindByItemId);
+          if (known.has(itemId)) method = "item/updated";
+        }
+      }
+      yield* handleNotification(state, { method, params: event.params });
     });
 
   const mapMspDecisionToProvider = (decision: string): ProviderApprovalDecision => {
@@ -790,7 +1391,7 @@ export const makeMuseAdapter = Effect.fn("makeMuseAdapter")(function* (
         options.binaryPath,
         ["serve", "--trust-workspace"],
         {
-          env: options.environment,
+          env: environment,
           extendEnv: true,
         },
       ).pipe(
@@ -798,7 +1399,7 @@ export const makeMuseAdapter = Effect.fn("makeMuseAdapter")(function* (
           MspClient.spawn({
             command: spawnCommand.command,
             args: spawnCommand.args,
-            env: options.environment,
+            env: environment,
             ...(cwd ? { cwd } : {}),
             shell: spawnCommand.shell,
           }),
@@ -892,6 +1493,8 @@ export const makeMuseAdapter = Effect.fn("makeMuseAdapter")(function* (
         pendingAnsweredUserInputs: yield* Ref.make(new Map<string, AnsweredUserInput>()),
         items: yield* Ref.make<Array<MspSchema.Item>>([]),
         itemKindByItemId: yield* Ref.make(new Map<string, string>()),
+        emittedTaskIds: yield* Ref.make(new Set<string>()),
+        completedTaskIds: yield* Ref.make(new Set<string>()),
         createdAt: sessionCreatedAt,
         runtimeMode: yield* Ref.make(input.runtimeMode),
         modelId: yield* Ref.make(input.modelSelection?.model),
@@ -1065,21 +1668,23 @@ export const makeMuseAdapter = Effect.fn("makeMuseAdapter")(function* (
     withThreadLock(input.threadId, (state) =>
       Effect.gen(function* () {
         const museSessionId = yield* Ref.get(state.museSessionId);
-        if (input.attachments && input.attachments.length > 0) {
-          const base = yield* emitBase({ threadId: input.threadId });
-          yield* emit({
-            ...base,
-            type: "runtime.warning",
-            payload: {
-              message: `Muse turns are text-only in this integration; ${input.attachments.length} attachment(s) were not sent.`,
-            },
-          } as ProviderRuntimeEvent);
-        }
-        if (!input.input || input.input.trim().length === 0) {
+        // Images ride the turn as native MSP `image` parts. Everything else
+        // (files, unknown types) already reaches the model through the on-disk
+        // path line ProviderService appends to the prompt, which is also MSP's
+        // own documented mechanism for files ("File mentions are text, not a
+        // part type"), so those need no part and no warning.
+        const imageParts = yield* Effect.forEach(
+          (input.attachments ?? []).filter((attachment) => attachment.type === "image"),
+          (attachment) => readImageInputPart(input.threadId, attachment),
+          { concurrency: 1 },
+        );
+        // A turn carrying only images is still a real submission; MSP requires
+        // a non-empty `input` array, not non-empty text.
+        if ((!input.input || input.input.trim().length === 0) && imageParts.length === 0) {
           return yield* new ProviderAdapterValidationError({
             provider: PROVIDER,
             operation: "sendTurn",
-            issue: "Muse requires non-empty turn input; promptless continuation is not supported.",
+            issue: "Muse requires turn input; promptless continuation is not supported.",
           });
         }
         if (input.modelSelection?.model) {
@@ -1100,7 +1705,12 @@ export const makeMuseAdapter = Effect.fn("makeMuseAdapter")(function* (
         const result = yield* state.client
           .turnStart({
             commandId,
-            input: [{ type: "text", text: input.input }],
+            input: [
+              ...(input.input && input.input.trim().length > 0
+                ? [{ type: "text" as const, text: input.input }]
+                : []),
+              ...imageParts,
+            ],
             sessionId: museSessionId,
           })
           .pipe(Effect.mapError(mapMspError(input.threadId, "turn/start")));
@@ -1424,6 +2034,11 @@ export const makeMuseAdapter = Effect.fn("makeMuseAdapter")(function* (
                 state.itemKindByItemId,
                 new Map(replacement.items.map((item) => [item.itemId, item.kind] as const)),
               );
+              // The fork is a different session with different item ids; the
+              // task rows opened against the source must not suppress the
+              // replacement's own start/completion events.
+              yield* Ref.set(state.emittedTaskIds, new Set<string>());
+              yield* Ref.set(state.completedTaskIds, new Set<string>());
             }),
           );
 

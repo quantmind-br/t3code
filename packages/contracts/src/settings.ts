@@ -725,13 +725,22 @@ export const MuseSettings = makeProviderSettingsSchema(
         providerSettingsForm: { placeholder: "muse", clearWhenEmpty: "omit" },
       }),
     ),
+    homePath: TrimmedString.pipe(
+      Schema.withDecodingDefault(Effect.succeed("")),
+      Schema.annotateKey({
+        title: "Muse profile directory",
+        description:
+          "Isolates this instance's Muse account and session state. Sets XDG_CONFIG_HOME and XDG_DATA_HOME for the spawned Muse process, so credentials live in <dir>/config/muse/auth.json and sessions in <dir>/data/muse. Run 'muse login' once with the same directories to sign this instance in. Leave empty to share the machine's default Muse account.",
+        providerSettingsForm: { placeholder: "~/.muse-work", clearWhenEmpty: "omit" },
+      }),
+    ),
     customModels: Schema.Array(CustomModelSetting).pipe(
       Schema.withDecodingDefault(Effect.succeed([])),
       Schema.annotateKey({ providerSettingsForm: { hidden: true } }),
     ),
   },
   {
-    order: ["binaryPath"],
+    order: ["binaryPath", "homePath"],
   },
 );
 export type MuseSettings = typeof MuseSettings.Type;
