@@ -707,10 +707,18 @@ export const GrokSettings = makeProviderSettingsSchema(
 export type GrokSettings = typeof GrokSettings.Type;
 
 /**
- * Muse Code driver settings — a post-migration driver (see `ProviderDriverKind`
- * in `providerInstance.ts`): configured only through `providerInstances`,
- * never through the legacy `providers.<kind>` map. Off by default, same as
- * Cursor/Grok/OpenCode: a new binding earns its way onto every install.
+ * Muse Code driver settings. Off by default, same as Cursor/Grok/OpenCode: a
+ * new binding earns its way onto every install.
+ *
+ * The `providers.muse` entry in `ServerSettings` is load-bearing even though
+ * instance config now lives in `providerInstances`. The settings UI renders a
+ * driver's default slot only when the server reports either an explicit
+ * instance or a legacy blob, and that gate is deliberate: a client may be
+ * talking to a server that predates the driver, where inventing a slot from
+ * the client's own driver list would advertise a provider that server cannot
+ * run. Without the entry the slot never renders and the driver cannot be
+ * enabled at all. `defaultEnabledForDriver` reads the same map, so omitting it
+ * would also silently flip this driver's default to enabled.
  */
 export const MuseSettings = makeProviderSettingsSchema(
   {
@@ -1082,6 +1090,7 @@ export const ServerSettings = Schema.Struct({
     grok: GrokSettings.pipe(Schema.withDecodingDefault(Effect.succeed({}))),
     opencode: OpenCodeSettings.pipe(Schema.withDecodingDefault(Effect.succeed({}))),
     antigravity: AntigravitySettings.pipe(Schema.withDecodingDefault(Effect.succeed({}))),
+    muse: MuseSettings.pipe(Schema.withDecodingDefault(Effect.succeed({}))),
   }).pipe(Schema.withDecodingDefault(Effect.succeed({}))),
   // New driver-agnostic instance map. Keyed by `ProviderInstanceId`; values
   // are `ProviderInstanceConfig` envelopes. The driver-specific config blob
@@ -1236,6 +1245,13 @@ const GrokSettingsPatch = Schema.Struct({
   customModels: Schema.optionalKey(Schema.Array(CustomModelSetting)),
 });
 
+const MuseSettingsPatch = Schema.Struct({
+  enabled: Schema.optionalKey(Schema.Boolean),
+  binaryPath: Schema.optionalKey(TrimmedString),
+  homePath: Schema.optionalKey(TrimmedString),
+  customModels: Schema.optionalKey(Schema.Array(CustomModelSetting)),
+});
+
 const AntigravitySettingsPatch = Schema.Struct({
   enabled: Schema.optionalKey(Schema.Boolean),
   authMethod: Schema.optionalKey(AntigravityAuthMethod),
@@ -1312,6 +1328,7 @@ export const ServerSettingsPatch = Schema.Struct({
       grok: Schema.optionalKey(GrokSettingsPatch),
       opencode: Schema.optionalKey(OpenCodeSettingsPatch),
       antigravity: Schema.optionalKey(AntigravitySettingsPatch),
+      muse: Schema.optionalKey(MuseSettingsPatch),
     }),
   ),
   // Whole-map replacement for the new instance config. Patching individual
